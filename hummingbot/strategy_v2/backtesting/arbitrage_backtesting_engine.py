@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.strategy_v2.backtesting.backtesting_engine_base import BacktestingEngineBase
-from hummingbot.strategy_v2.controllers.arbitrage_controller import ArbitrageController, ArbitrageControllerConfig
+from hummingbot.strategy_v2.controllers.arbitrage_controller import ArbitrageControllerConfig
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
@@ -63,41 +63,42 @@ class ArbitrageBacktestingEngine(BacktestingEngineBase):
         """
         Updates the state of the controller with the current market data.
         """
-        # Update the time in the market data provider
-        self.controller.market_data_provider._time = row['timestamp']
+        # Update the time in the market data provider using a proper method instead of direct attribute access
+        self.controller.market_data_provider.update_time(row['timestamp'])
         
         # Update processed data in the controller
         await self.update_processed_data(row)
         
         # Simulate execution
-        await self.simulate_execution(self.trade_cost)
+        await self.simulate_execution(self.config.trade_cost)
     
     async def update_processed_data(self, row: pd.Series):
         """
         Updates processed data in the controller with the current price data.
         """
-        # Update processed data with current prices from both exchanges
-        self.controller.processed_data.update({
+        # Generate signal for current prices
+        current_signal = self.controller.generate_signal(row['close_1'], row['close_2'])
+        
+        # Create current data point
+        current_data = {
             "timestamp": row['timestamp'],
             "price_1": row['close_1'],
             "price_2": row['close_2'],
             "price_diff": row['price_diff'],
             "price_diff_pct": row['price_diff_pct'],
-            "signal": self.controller.generate_signal(row['close_1'], row['close_2'])
-        })
+            "signal": current_signal
+        }
         
-        # Update the features dataframe
+        # Update processed data with current point
+        self.controller.processed_data["current"] = current_data
+        self.controller.processed_data["signal"] = current_signal
+        
+        # Initialize features dataframe if it doesn't exist
         if "features" not in self.controller.processed_data:
             self.controller.processed_data["features"] = pd.DataFrame()
         
-        new_row = pd.DataFrame([{
-            "timestamp": row['timestamp'],
-            "price_1": row['close_1'],
-            "price_2": row['close_2'],
-            "price_diff": row['price_diff'],
-            "price_diff_pct": row['price_diff_pct'],
-            "signal": self.controller.processed_data["signal"]
-        }])
+        # Add current data to features history
+        new_row = pd.DataFrame([current_data])
         
         self.controller.processed_data["features"] = pd.concat([
             self.controller.processed_data["features"], 

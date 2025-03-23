@@ -1,4 +1,5 @@
 # scripts/arbitrage_strategy.py
+# start --script arbitrage_strategy.py --conf conf_arbitrage_strategy_1.yml
 
 import asyncio
 import logging
@@ -8,6 +9,7 @@ from typing import Dict, List, Optional, Set, Tuple, ClassVar
 
 import pandas as pd
 from pydantic import Field, validator
+import yaml
 
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.client.ui.interface_utils import format_df_for_printout
@@ -23,6 +25,309 @@ from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy.strategy_v2_base import StrategyV2ConfigBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
+from hummingbot.client import settings
+from hummingbot.client.settings import AllConnectorSettings
+from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.connector.exchange.paper_trade import PaperTradeExchange
+from hummingbot.client.config.client_config_map import ClientConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.core.utils.trading_pair_fetcher import TradingPairFetcher
+from hummingbot.client.config.security import Security
+
+
+class ArbitrageControllerConfig(ControllerConfigBase):
+    """
+    Configuration for the arbitrage controller.
+    """
+    controller_name: str = "arbitrage_controller"
+    controller_type: str = "arbitrage"
+    candles_config: List[CandlesConfig] = Field(default_factory=list)
+    
+    # First connector (exchange)
+    connector1: str
+    
+    # Second connector (exchange)
+    connector2: str
+    
+    # Minimum price difference percentage to trigger trades
+    min_profitability: Decimal
+    
+    # Order amount in quote currency
+    order_amount: Decimal
+    
+    # Cooldown time between trades (in seconds)
+    cooldown_time: int
+    
+    # Maximum number of concurrent arbitrage positions
+    max_concurrent_positions: int
+    
+    # Trading pair to monitor (now optional as we'll scan for common pairs)
+    trading_pair: Optional[str] = None
+    
+    config_update_interval: int = Field(default=60)
+    
+    @validator('min_profitability', 'order_amount', pre=True, allow_reuse=True)
+    def validate_decimal(cls, v):
+        if isinstance(v, str):
+            return Decimal(v)
+        return v
+    
+    def update_markets(self, markets: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+        """
+        Updates the markets dictionary with the trading pairs needed for this controller.
+        """
+        if self.connector1 not in markets:
+            markets[self.connector1] = set()
+        if self.connector2 not in markets:
+            markets[self.connector2] = set()
+        
+        # Only add the specific trading pair if provided
+        if self.trading_pair:
+            markets[self.connector1].add(self.trading_pair)
+            markets[self.connector2].add(self.trading_pair)
+        
+        return markets
+
+
+class ArbitrageController(ControllerBase):
+    """
+    Controller for arbitrage strategy.
+    """
+    
+    def __init__(self, config: ArbitrageControllerConfig, market_data_provider, actions_queue, update_interval=1.0):
+        super().__init__(config, market_data_provider, actions_queue, update_interval)
+        self.common_trading_pairs = []
+        self.processed_data = {"opportunities": []}
+        self.pair_last_trade_timestamps = {}
+        self.executors_info = []
+    
+    async def control_loop(self):
+        """
+        Main control loop for the arbitrage controller.
+        """
+        try:
+            # Check if market data provider is ready
+            if not self.market_data_provider.ready:
+                self.logger().info("Market data provider not ready. Waiting...")
+                await asyncio.sleep(5.0)
+                return
+                
+            # Check if both connectors exist and are ready
+            connector_issues = []
+            
+            # First check if connectors exist in the market data provider
+            if self.config.connector1 not in self.market_data_provider.connectors:
+                connector_issues.append(f"Connector '{self.config.connector1}' not found in available connectors")
+            
+            if self.config.connector2 not in self.market_data_provider.connectors:
+                connector_issues.append(f"Connector '{self.config.connector2}' not found in available connectors")
+            
+            # If any connector is missing, log detailed error and retry later
+            if connector_issues:
+                self.logger().error(f"Connector initialization issues: {'; '.join(connector_issues)}")
+                self.logger().info(f"Available connectors: {list(self.market_data_provider.connectors.keys())}")
+                # Use a counter to reduce log spam but still show periodic updates
+                if not hasattr(self, '_connector_retry_count'):
+                    self._connector_retry_count = 0
+                self._connector_retry_count += 1
+                
+                # Log only every 5 attempts to reduce spam
+                if self._connector_retry_count % 5 == 1:
+                    self.logger().info(f"Will retry connector initialization (attempt {self._connector_retry_count})")
+                await asyncio.sleep(10.0)  # Shorter sleep for faster recovery
+                return
+            
+            # Reset retry counter when connectors are available
+            if hasattr(self, '_connector_retry_count'):
+                self._connector_retry_count = 0
+                
+            # Check if connectors are ready for trading
+            connector1 = self.market_data_provider.connectors[self.config.connector1]
+            connector2 = self.market_data_provider.connectors[self.config.connector2]
+            
+            if not connector1.ready:
+                self.logger().info(f"Connector '{self.config.connector1}' not ready yet. Waiting...")
+                await asyncio.sleep(5.0)
+                return
+                
+            if not connector2.ready:
+                self.logger().info(f"Connector '{self.config.connector2}' not ready yet. Waiting...")
+                await asyncio.sleep(5.0)
+                return
+                
+            # Try to find common trading pairs
+            if not self.common_trading_pairs:
+                try:
+                    self.common_trading_pairs = self.find_common_trading_pairs()
+                    if not self.common_trading_pairs:
+                        self.logger().warning("No common trading pairs found between exchanges.")
+                        # Check if specific trading pair was configured
+                        if self.config.trading_pair:
+                            self.logger().error(f"Configured trading pair '{self.config.trading_pair}' not available on both exchanges.")
+                            # Check if the pair exists on either exchange
+                            pair_on_ex1 = self.config.trading_pair in self.market_data_provider.get_trading_pairs(self.config.connector1)
+                            pair_on_ex2 = self.config.trading_pair in self.market_data_provider.get_trading_pairs(self.config.connector2)
+                            
+                            if not pair_on_ex1 and not pair_on_ex2:
+                                self.logger().error(f"Trading pair '{self.config.trading_pair}' not found on either exchange.")
+                            elif not pair_on_ex1:
+                                self.logger().error(f"Trading pair '{self.config.trading_pair}' not found on {self.config.connector1}.")
+                            elif not pair_on_ex2:
+                                self.logger().error(f"Trading pair '{self.config.trading_pair}' not found on {self.config.connector2}.")
+                        
+                        # Retry after delay but not too frequently
+                        if not hasattr(self, '_pairs_retry_count'):
+                            self._pairs_retry_count = 0
+                        self._pairs_retry_count += 1
+                        
+                        # Gradually increase retry interval to avoid hammering the API
+                        retry_delay = min(30.0, 5.0 + self._pairs_retry_count)
+                        self.logger().info(f"Will retry finding common pairs in {retry_delay:.1f} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        return
+                    else:
+                        self.logger().info(f"Found {len(self.common_trading_pairs)} common trading pairs.")
+                        # Reset retry counter on success
+                        if hasattr(self, '_pairs_retry_count'):
+                            self._pairs_retry_count = 0
+                except Exception as e:
+                    self.logger().error(f"Error finding common pairs: {str(e)}", exc_info=True)
+                    await asyncio.sleep(10.0)
+                    return
+            
+            # Rest of controller logic for checking arbitrage opportunities
+            # This part would continue with your existing implementation
+            
+        except Exception as e:
+            self.logger().error(f"Unexpected error in control loop: {str(e)}", exc_info=True)
+            await asyncio.sleep(5.0)
+    
+    def find_common_trading_pairs(self) -> List[str]:
+        """
+        Finds trading pairs that are common to both exchanges.
+        """
+        connector1_pairs = self.market_data_provider.get_trading_pairs(self.config.connector1)
+        connector2_pairs = self.market_data_provider.get_trading_pairs(self.config.connector2)
+        
+        # Find common pairs
+        common_pairs = list(set(connector1_pairs).intersection(set(connector2_pairs)))
+        self.logger().info(f"Found {len(common_pairs)} common trading pairs between {self.config.connector1} and {self.config.connector2}")
+        return common_pairs
+    
+    def check_arbitrage_opportunity(self, trading_pair: str) -> Optional[Dict]:
+        """
+        Checks for an arbitrage opportunity between the two exchanges for a specific trading pair.
+        """
+        # Get current bid/ask prices from both exchanges
+        ex1_ticker = self.market_data_provider.get_ticker(self.config.connector1, trading_pair)
+        ex2_ticker = self.market_data_provider.get_ticker(self.config.connector2, trading_pair)
+        
+        if not ex1_ticker or not ex2_ticker:
+            return None
+        
+        # Calculate price differences and profitability
+        profit_pct_1 = (ex2_ticker.bid - ex1_ticker.ask) / ex1_ticker.ask * Decimal("100")
+        profit_pct_2 = (ex1_ticker.bid - ex2_ticker.ask) / ex2_ticker.ask * Decimal("100")
+        
+        # Detect profitable opportunities
+        if profit_pct_1 > profit_pct_2 and profit_pct_1 >= self.config.min_profitability:
+            return {
+                "pair": trading_pair,
+                "buy_exchange": self.config.connector1,
+                "sell_exchange": self.config.connector2,
+                "buy_price": float(ex1_ticker.ask),
+                "sell_price": float(ex2_ticker.bid),
+                "profit_pct": float(profit_pct_1),
+                "timestamp": self.current_timestamp
+            }
+        elif profit_pct_2 >= self.config.min_profitability:
+            return {
+                "pair": trading_pair,
+                "buy_exchange": self.config.connector2,
+                "sell_exchange": self.config.connector1,
+                "buy_price": float(ex2_ticker.ask),
+                "sell_price": float(ex1_ticker.bid),
+                "profit_pct": float(profit_pct_2),
+                "timestamp": self.current_timestamp
+            }
+        
+        return None
+    
+    async def create_arbitrage_executor(self, trading_pair: str, buy_exchange: str, sell_exchange: str, profit_pct: float):
+        """
+        Creates an arbitrage executor for a specific opportunity.
+        """
+        executor_config = ArbitrageExecutorConfig(
+            type="arbitrage_executor",
+            buying_market=ConnectorPair(connector_name=buy_exchange, trading_pair=trading_pair),
+            selling_market=ConnectorPair(connector_name=sell_exchange, trading_pair=trading_pair),
+            order_amount=self.config.order_amount,
+            min_profitability=self.config.min_profitability
+        )
+        
+        executor_action = CreateExecutorAction(executor_config=executor_config)
+        await self.actions_queue.put(executor_action)
+        
+        self.logger().info(f"Created arbitrage executor for {trading_pair}: Buy on {buy_exchange}, Sell on {sell_exchange}, Profit: {profit_pct:.2f}%")
+    
+    def format_status(self) -> str:
+        """
+        Format status output for the strategy.
+        """
+        if not self.processed_data:
+            return "No data available yet."
+        
+        lines = []
+        lines.append(f"\n  Arbitrage Controller: {self.config.controller_name}")
+        lines.append(f"  Monitoring {len(self.common_trading_pairs)} pairs between {self.config.connector1} and {self.config.connector2}")
+        
+        # Format opportunities
+        if self.processed_data.get("opportunities"):
+            df = pd.DataFrame(self.processed_data["opportunities"])
+            df = df.sort_values("profit_pct", ascending=False)
+            lines.append("\n  Current Arbitrage Opportunities:")
+            lines.append(format_df_for_printout(df, table_format="pretty"))
+        else:
+            lines.append("\n  No arbitrage opportunities found.")
+        
+        # Format active executors
+        if self.executors_info:
+            lines.append(f"\n  Active Positions: {len(self.executors_info)}/{self.config.max_concurrent_positions}")
+            for executor_info in self.executors_info:
+                lines.append(f"    - {executor_info.executor_id}: {executor_info.config.buying_market.trading_pair}")
+        else:
+            lines.append("\n  No active positions.")
+        
+        return "\n".join(lines)
+
+    def log_price_comparison(self, trading_pair: str, ex1_ticker, ex2_ticker):
+        """Log real-time price comparison between exchanges"""
+        if not ex1_ticker or not ex2_ticker:
+            return
+        
+        # Always log focused pairs, or all pairs if no focus set
+        focused_pairs = getattr(self.config, 'focused_pairs', [])
+        if focused_pairs and trading_pair not in focused_pairs:
+            return
+        
+        # Calculate spread
+        spread_1 = (ex1_ticker.bid - ex1_ticker.ask) / ex1_ticker.ask * Decimal("100") 
+        spread_2 = (ex2_ticker.bid - ex2_ticker.ask) / ex2_ticker.ask * Decimal("100")
+        
+        # Calculate cross-exchange price differences
+        diff_pct_1 = (ex2_ticker.bid - ex1_ticker.ask) / ex1_ticker.ask * Decimal("100")
+        diff_pct_2 = (ex1_ticker.bid - ex2_ticker.ask) / ex2_ticker.ask * Decimal("100")
+        
+        # Format log message
+        log_msg = f"PRICE: {trading_pair} | " \
+                  f"{self.config.connector1}: ask={ex1_ticker.ask:.8f} bid={ex1_ticker.bid:.8f} spread={spread_1:.4f}% | " \
+                  f"{self.config.connector2}: ask={ex2_ticker.ask:.8f} bid={ex2_ticker.bid:.8f} spread={spread_2:.4f}% | " \
+                  f"Opportunity 1→2: {diff_pct_1:.4f}% | 2→1: {diff_pct_2:.4f}%"
+        
+        # Log to both logger and print to stdout
+        self.logger().info(log_msg)
+        print(log_msg)
 
 
 class ArbitrageStrategyConfig(StrategyV2ConfigBase):
@@ -34,14 +339,14 @@ class ArbitrageStrategyConfig(StrategyV2ConfigBase):
     connector1: str = Field(
         default="binance",
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter the first connector name (e.g., binance): ",
+            prompt=lambda mi: "Enter the first connector name (e.g., binance_paper_trade): ",
             prompt_on_new=True))
     
     # Second connector (exchange)
     connector2: str = Field(
-        default="kucoin",
+        default="bybit",
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter the second connector name (e.g., kucoin): ",
+            prompt=lambda mi: "Enter the second connector name (e.g., bybit_paper_trade): ",
             prompt_on_new=True))
     
     # Trading pair to monitor (optional)
@@ -79,408 +384,28 @@ class ArbitrageStrategyConfig(StrategyV2ConfigBase):
             prompt=lambda mi: "Enter maximum number of concurrent positions: ",
             prompt_on_new=True))
 
+    config_update_interval: int = Field(default=60)
+
+    @validator('min_profitability', 'order_amount', pre=True, allow_reuse=True)
+    def validate_decimal(cls, v):
+        if isinstance(v, str):
+            return Decimal(v)
+        return v
+
     def load_controller_configs(self) -> List[ControllerConfigBase]:
         controller_config = ArbitrageControllerConfig(
             controller_name="arbitrage_controller",
-            trading_pair=self.trading_pair,
+            controller_type="arbitrage",
             connector1=self.connector1,
             connector2=self.connector2,
             min_profitability=self.min_profitability,
             order_amount=self.order_amount,
             cooldown_time=self.cooldown_time,
-            max_concurrent_positions=self.max_concurrent_positions
+            max_concurrent_positions=self.max_concurrent_positions,
+            trading_pair=self.trading_pair,
+            config_update_interval=self.config_update_interval
         )
         return [controller_config]
-
-
-# Define the ArbitrageExecutorConfig class
-class ArbitrageExecutorConfig:
-    def __init__(self, id: str, buying_market: ConnectorPair, selling_market: ConnectorPair, 
-                 order_amount: Decimal, min_profitability: Decimal, max_retries: int = 3):
-        self.id = id
-        self.type = "arbitrage_executor"
-        self.buying_market = buying_market
-        self.selling_market = selling_market
-        self.order_amount = order_amount
-        self.min_profitability = min_profitability
-        self.max_retries = max_retries
-
-
-# Define the ArbitrageControllerConfig class
-class ArbitrageControllerConfig(ControllerConfigBase):
-    """
-    Configuration for the arbitrage controller.
-    """
-    controller_name: str = "arbitrage_controller"
-    controller_type: str = "arbitrage"
-    candles_config: List[CandlesConfig] = Field(default_factory=list)
-    
-    # First connector (exchange)
-    connector1: str
-    
-    # Second connector (exchange)
-    connector2: str
-    
-    # Minimum price difference percentage to trigger trades
-    min_profitability: Decimal
-    
-    # Order amount in quote currency
-    order_amount: Decimal
-    
-    # Cooldown time between trades (in seconds)
-    cooldown_time: int
-    
-    # Maximum number of concurrent arbitrage positions
-    max_concurrent_positions: int
-    
-    # Trading pair to monitor (now optional as we'll scan for common pairs)
-    trading_pair: Optional[str] = None
-    
-    @validator('min_profitability', pre=True)
-    def validate_decimal(cls, v):
-        if isinstance(v, str):
-            return Decimal(v)
-        return v
-    
-    @validator('order_amount', pre=True)
-    def validate_order_amount(cls, v):
-        if isinstance(v, str):
-            return Decimal(v)
-        return v
-    
-    def update_markets(self, markets: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
-        """
-        Updates the markets dictionary with the trading pairs needed by this controller.
-        """
-        # If a specific trading pair is provided, use that
-        if self.trading_pair:
-            if self.connector1 not in markets:
-                markets[self.connector1] = set()
-            if self.connector2 not in markets:
-                markets[self.connector2] = set()
-            
-            markets[self.connector1].add(self.trading_pair)
-            markets[self.connector2].add(self.trading_pair)
-        else:
-            # For scanning all pairs, we need to ensure both connectors are in the markets dict
-            if self.connector1 not in markets:
-                markets[self.connector1] = set()
-            if self.connector2 not in markets:
-                markets[self.connector2] = set()
-        
-        return markets
-
-
-class ArbitrageController(ControllerBase):
-    """
-    Controller for arbitrage strategies.
-    """
-    _logger = None
-    
-    @classmethod
-    def logger(cls) -> HummingbotLogger:
-        if cls._logger is None:
-            cls._logger = logging.getLogger(__name__)
-        return cls._logger
-    
-    def __init__(self, config: ArbitrageControllerConfig, market_data_provider, actions_queue, update_interval: float = 1.0):
-        """
-        Initialize the arbitrage controller.
-        """
-        super().__init__(config, market_data_provider, actions_queue, update_interval)
-        self.config = config
-        self.market_data_provider = market_data_provider
-        self.actions_queue = actions_queue
-        self.update_interval = update_interval
-        
-        # For tracking active executors
-        self.executors_info = []
-        self.executors_update_event = None
-        
-        # For storing processed data
-        self.processed_data = {}
-        
-        # For tracking last trade timestamp
-        self.last_trade_timestamp = 0
-        
-        # For tracking common trading pairs
-        self.common_trading_pairs = []
-        self.pair_last_trade_timestamps = {}
-        
-        self.logger().info("ArbitrageController initialized")
-    
-    async def start(self):
-        """
-        Starts the controller.
-        """
-        self.logger().info("Starting ArbitrageController...")
-        self.executors_update_event = asyncio.Event()
-        self.processed_data = {}
-        self.last_trade_timestamp = 0
-        self.common_trading_pairs = self.find_common_trading_pairs()
-        self.pair_last_trade_timestamps = {pair: 0 for pair in self.common_trading_pairs}
-        
-        # Initialize processed data for each pair
-        for pair in self.common_trading_pairs:
-            self.processed_data[pair] = {
-                "price_1": Decimal("0"),
-                "price_2": Decimal("0"),
-                "price_diff": Decimal("0"),
-                "price_diff_pct": Decimal("0"),
-                "signal": 0
-            }
-        
-        self.status = RunnableStatus.RUNNING
-        
-        self.logger().info(f"ArbitrageController started with {len(self.common_trading_pairs)} common trading pairs")
-        if self.common_trading_pairs:
-            self.logger().info(f"Monitoring pairs: {', '.join(self.common_trading_pairs[:10])}" + 
-                              (f" and {len(self.common_trading_pairs) - 10} more..." if len(self.common_trading_pairs) > 10 else ""))
-    
-    def find_common_trading_pairs(self) -> List[str]:
-        """
-        Finds trading pairs that are common to both exchanges.
-        """
-        # If a specific trading pair is provided, use that
-        if self.config.trading_pair:
-            self.logger().info(f"Using specified trading pair: {self.config.trading_pair}")
-            return [self.config.trading_pair]
-        
-        # Otherwise, find common pairs
-        self.logger().info(f"Scanning for common trading pairs between {self.config.connector1} and {self.config.connector2}...")
-        connector1_pairs = self.market_data_provider.get_trading_pairs(self.config.connector1)
-        connector2_pairs = self.market_data_provider.get_trading_pairs(self.config.connector2)
-        
-        # Find common pairs
-        common_pairs = list(set(connector1_pairs).intersection(set(connector2_pairs)))
-        
-        # Log the common pairs
-        self.logger().info(f"Found {len(common_pairs)} common trading pairs between {self.config.connector1} and {self.config.connector2}")
-        if common_pairs:
-            self.logger().info(f"Common pairs: {', '.join(common_pairs[:10])}" + 
-                              (f" and {len(common_pairs) - 10} more..." if len(common_pairs) > 10 else ""))
-        else:
-            self.logger().warning(f"No common trading pairs found between {self.config.connector1} and {self.config.connector2}")
-        
-        return common_pairs
-    
-    def generate_signal(self, price1: float, price2: float) -> int:
-        """
-        Generates a trading signal based on price difference.
-        
-        :param price1: Price on the first exchange
-        :param price2: Price on the second exchange
-        :return: Signal (1 for buy on exchange 2, sell on exchange 1; -1 for buy on exchange 1, sell on exchange 2; 0 for no trade)
-        """
-        # Calculate price difference percentage
-        price_diff_pct = abs((price1 - price2) / price2) * 100
-        
-        # If price difference is greater than min_profitability, generate a signal
-        if price_diff_pct >= float(self.config.min_profitability):
-            if price1 > price2:
-                return 1  # Buy on exchange 2, sell on exchange 1
-            else:
-                return -1  # Buy on exchange 1, sell on exchange 2
-        
-        return 0  # No trade
-    
-    async def update(self):
-        """
-        Updates the controller state and determines actions to take.
-        """
-        if self.status != RunnableStatus.RUNNING:
-            return
-        
-        # Determine actions to take
-        actions = await self.determine_actions()
-        
-        # If there are actions to take, put them in the queue
-        if actions:
-            await self.actions_queue.put(actions)
-            self.logger().info(f"Added {len(actions)} actions to the queue")
-    
-    async def determine_actions(self) -> List[ExecutorAction]:
-        """
-        Determines what actions to take based on the current market conditions.
-        """
-        # Get active executors
-        active_executors = [e for e in self.executors_info if e.is_active]
-        
-        # Check if we've reached the maximum number of concurrent positions
-        if len(active_executors) >= self.config.max_concurrent_positions:
-            self.logger().debug(f"Maximum concurrent positions reached ({self.config.max_concurrent_positions})")
-            return []
-        
-        # Determine actions
-        actions = await self.determine_executor_actions()
-        
-        return actions
-    
-    async def determine_executor_actions(self) -> List[ExecutorAction]:
-        """
-        Determines what actions to take based on the current market conditions.
-        """
-        actions = []
-        current_time = self.market_data_provider.time()
-        opportunities = []
-        
-        # Process each common trading pair
-        for trading_pair in self.common_trading_pairs:
-            try:
-                # Check if we're in cooldown period for this pair
-                if current_time - self.pair_last_trade_timestamps.get(trading_pair, 0) < self.config.cooldown_time:
-                    continue
-                
-                # Get current prices
-                price1 = self.market_data_provider.get_price(self.config.connector1, trading_pair)
-                price2 = self.market_data_provider.get_price(self.config.connector2, trading_pair)
-                
-                # Skip if either price is None or zero
-                if price1 is None or price2 is None or price1 == 0 or price2 == 0:
-                    continue
-                
-                # Calculate price difference and generate signal
-                signal = self.generate_signal(float(price1), float(price2))
-                price_diff_pct = abs((price1 - price2) / price2) * 100
-                
-                # Store processed data
-                self.processed_data[trading_pair] = {
-                    "price_1": price1,
-                    "price_2": price2,
-                    "price_diff": price1 - price2,
-                    "price_diff_pct": price_diff_pct,
-                    "signal": signal
-                }
-                
-                # If there's a signal, add to opportunities
-                if signal != 0:
-                    opportunities.append((trading_pair, price_diff_pct, signal))
-                
-                # Check for active executors for this pair
-                active_executors = [e for e in self.executors_info if e.is_active and trading_pair in e.id]
-                
-                # Check if we should close any positions (price difference is close to zero)
-                for executor_info in active_executors:
-                    # If the price difference is close to zero (within 0.1%), close the position
-                    if price_diff_pct < 0.1:
-                        self.logger().info(f"Closing position for {trading_pair} as price difference is now {price_diff_pct:.2f}%")
-                        actions.append(StopExecutorAction(
-                            controller_id=self.config.id,
-                            executor_id=executor_info.id,
-                            keep_position=False
-                        ))
-            
-            except Exception as e:
-                self.logger().error(f"Error processing pair {trading_pair}: {e}")
-        
-        # Sort opportunities by price difference percentage (descending)
-        opportunities.sort(key=lambda x: x[1], reverse=True)
-        
-        # Log top opportunities
-        if opportunities:
-            self.logger().info(f"Top arbitrage opportunities:")
-            for i, (pair, diff_pct, signal) in enumerate(opportunities[:5]):
-                direction = "Buy on 2, Sell on 1" if signal == 1 else "Buy on 1, Sell on 2"
-                self.logger().info(f"  {i+1}. {pair}: {diff_pct:.2f}% - {direction}")
-        
-        # Get active executors
-        active_executors = [e for e in self.executors_info if e.is_active]
-        
-        # Check if we can create a new executor
-        if opportunities and len(active_executors) < self.config.max_concurrent_positions:
-            # Take the best opportunity
-            best_pair, _, signal = opportunities[0]
-            
-            # Check if we already have an executor for this pair
-            if not any(best_pair in e.id for e in active_executors):
-                self.logger().info(f"Creating new arbitrage executor for {best_pair} with {signal}")
-                
-                # Create the executor
-                if signal == 1:  # Buy on exchange 2, sell on exchange 1
-                    buying_market = ConnectorPair(connector_name=self.config.connector2, trading_pair=best_pair)
-                    selling_market = ConnectorPair(connector_name=self.config.connector1, trading_pair=best_pair)
-                else:  # Buy on exchange 1, sell on exchange 2
-                    buying_market = ConnectorPair(connector_name=self.config.connector1, trading_pair=best_pair)
-                    selling_market = ConnectorPair(connector_name=self.config.connector2, trading_pair=best_pair)
-                
-                # Create a unique ID for the executor
-                signal_str = "buy_2_sell_1" if signal == 1 else "buy_1_sell_2"
-                executor_id = f"arbitrage_{best_pair}_{signal_str}_{int(current_time)}"
-                
-                # Create the executor config
-                executor_config = ArbitrageExecutorConfig(
-                    id=executor_id,
-                    buying_market=buying_market,
-                    selling_market=selling_market,
-                    order_amount=self.config.order_amount,
-                    min_profitability=self.config.min_profitability,
-                    max_retries=3
-                )
-                
-                # Create the executor action
-                actions.append(CreateExecutorAction(
-                    controller_id=self.config.id,
-                    executor_config=executor_config
-                ))
-                
-                # Update the last trade timestamp for this pair
-                self.pair_last_trade_timestamps[best_pair] = current_time
-                self.logger().info(f"Created arbitrage executor for {best_pair}")
-        
-        return actions
-    
-    async def stop(self):
-        """
-        Stops the controller.
-        """
-        self.logger().info("Stopping ArbitrageController...")
-        self.status = RunnableStatus.TERMINATED
-        self.logger().info("ArbitrageController stopped")
-    
-    def to_format_status(self) -> List[str]:
-        """
-        Returns the status of the controller as a list of strings.
-        """
-        lines = []
-        lines.append("Arbitrage Strategy")
-        lines.append(f"Status: {self.status.name}")
-        lines.append(f"Exchanges: {self.config.connector1} and {self.config.connector2}")
-        lines.append(f"Min Profitability: {self.config.min_profitability}%")
-        lines.append(f"Order Amount: {self.config.order_amount}")
-        lines.append(f"Cooldown Time: {self.config.cooldown_time} seconds")
-        lines.append(f"Max Concurrent Positions: {self.config.max_concurrent_positions}")
-        
-        # Add common trading pairs info
-        lines.append(f"Monitoring {len(self.common_trading_pairs)} common trading pairs")
-        
-        # Add top opportunities
-        opportunities = []
-        for pair, data in self.processed_data.items():
-            if data["signal"] != 0:
-                opportunities.append((pair, data["price_diff_pct"], data["signal"]))
-        
-        # Sort opportunities by price difference percentage (descending)
-        opportunities.sort(key=lambda x: x[1], reverse=True)
-        
-        if opportunities:
-            lines.append("\nTop Arbitrage Opportunities:")
-            for i, (pair, diff_pct, signal) in enumerate(opportunities[:5]):
-                direction = "Buy on 2, Sell on 1" if signal == 1 else "Buy on 1, Sell on 2"
-                lines.append(f"  {i+1}. {pair}: {diff_pct:.2f}% - {direction}")
-        else:
-            lines.append("\nNo arbitrage opportunities found")
-        
-        # Add active executors info
-        active_executors = [e for e in self.executors_info if e.is_active]
-        if active_executors:
-            lines.append("\nActive Executors:")
-            for executor in active_executors:
-                lines.append(f"  ID: {executor.id}")
-                lines.append(f"  Net PnL: {executor.net_pnl_quote}")
-                lines.append(f"  Created: {executor.timestamp}")
-                lines.append("")
-        
-        return lines
 
 
 class ArbitrageStrategy(StrategyV2Base):
@@ -515,58 +440,242 @@ class ArbitrageStrategy(StrategyV2Base):
         if connectors is None:
             connectors = {}
         
+        # If config is None, create a default one
+        if config is None:
+            config = ArbitrageStrategyConfig()
+            self.init_markets(config)
+        
         # Make sure markets are initialized
         if not self.markets and config is not None:
             self.init_markets(config)
         
+        # Store BEFORE super().__init__ so it's not overwritten
+        self.strategy_config = config
+        
+        # Important: Call super() without the controller creation
         super().__init__(connectors=connectors, config=config)
-        self.config = config
-        self.logger().info("ArbitrageStrategy initialized")
     
     def initialize_controllers(self):
-        """Initialize controllers for the strategy"""
-        if self.config is None:
-            return
-        
-        controller_config = ArbitrageControllerConfig(
-            controller_name="arbitrage_controller",
-            trading_pair=self.config.trading_pair,
-            connector1=self.config.connector1,
-            connector2=self.config.connector2,
-            min_profitability=self.config.min_profitability,
-            order_amount=self.config.order_amount,
-            cooldown_time=self.config.cooldown_time,
-            max_concurrent_positions=self.config.max_concurrent_positions
-        )
-        
-        self.controllers["arbitrage_controller"] = ArbitrageController(
-            config=controller_config,
-            market_data_provider=self.market_data_provider,
-            actions_queue=self.actions_queue,
-            update_interval=1.0
-        )
-        
-    async def process_actions(self):
-        """Process actions from controllers"""
-        while True:
-            action = await self.actions_queue.get()
-            self.logger().debug(f"Processing action: {action}")
+        """Override to properly initialize our controller"""
+        try:
+            controller_config = ArbitrageControllerConfig(
+                controller_name="arbitrage_controller",
+                controller_type="arbitrage",
+                connector1=self.strategy_config.connector1,
+                connector2=self.strategy_config.connector2,
+                min_profitability=self.strategy_config.min_profitability,
+                order_amount=self.strategy_config.order_amount,
+                cooldown_time=self.strategy_config.cooldown_time,
+                max_concurrent_positions=self.strategy_config.max_concurrent_positions,
+                trading_pair=self.strategy_config.trading_pair,
+                config_update_interval=self.strategy_config.config_update_interval
+            )
             
-            if isinstance(action, CreateExecutorAction):
-                await self.executor_orchestrator.create_executor(action.executor_config)
-            elif isinstance(action, StopExecutorAction):
-                await self.executor_orchestrator.stop_executor(action.executor_id)
-            else:
-                self.logger().warning(f"Unknown action type: {type(action)}")
+            controller = controller_config.get_controller_class()(
+                config=controller_config,
+                market_data_provider=self.market_data_provider,
+                actions_queue=self.actions_queue
+            )
+            controller.start()
+            self.controllers[controller_config.controller_name] = controller
+            self.logger().info(f"Controller {controller_config.controller_name} initialized successfully")
+        except Exception as e:
+            self.logger().error(f"Failed to initialize controller: {str(e)}", exc_info=True)
+            self.logger().warning("Strategy will run without controller functionality")
+    
+    def create_actions_proposal(self) -> List[ExecutorAction]:
+        """
+        Create actions proposal for the strategy.
+        This method is required for StrategyV2Base and is called by determine_executor_actions.
+        """
+        # For arbitrage strategies, typically no actions are created directly
+        # Instead, controllers trigger actions when they detect opportunities
+        return []
+    
+    def stop_actions_proposal(self) -> List[StopExecutorAction]:
+        """
+        Create a list of actions to stop executors.
+        This method is required for StrategyV2Base and is called by determine_executor_actions.
+        """
+        # For our arbitrage strategy, we let the controllers handle stopping executors
+        # based on their own logic, so we don't add any stop actions here
+        return []
+    
+    def format_status(self) -> str:
+        """Format status of the strategy for display."""
+        if not hasattr(self, 'strategy_config'):
+            return "Strategy not properly initialized"
+        
+        # Check for connector readiness differently - avoid false warnings
+        for exchange_name in [self.strategy_config.connector1, self.strategy_config.connector2]:
+            if exchange_name not in self.connectors:
+                return f"{exchange_name} is not available. Please connect first."
+        
+        # Rest of method stays the same but use self.strategy_config instead of self._strategy_config
+        lines = []
+        lines.append("Arbitrage Strategy")
+        lines.append(f"Trading pair: {self.strategy_config.trading_pair or 'Auto-detecting common pairs'}")
+        lines.append(f"Exchange 1: {self.strategy_config.connector1}")
+        lines.append(f"Exchange 2: {self.strategy_config.connector2}")
+        lines.append(f"Min profitability: {self.strategy_config.min_profitability}%")
+        lines.append(f"Order amount: {self.strategy_config.order_amount}")
+        
+        # Add active executors info
+        active_executors = len(self.executor_orchestrator.active_executors)
+        lines.append(f"\nActive arbitrage executions: {active_executors}")
+        
+        # Controller status
+        for controller_name, controller in self.controllers.items():
+            if hasattr(controller, "processed_data") and controller.processed_data:
+                lines.append(f"\n{controller_name.upper()} STATUS:")
                 
-            self.actions_queue.task_done()
+                # Opportunities
+                if "opportunities" in controller.processed_data and controller.processed_data["opportunities"]:
+                    opps = controller.processed_data["opportunities"]
+                    lines.append("\nCurrent Opportunities:")
+                    
+                    # Convert to DataFrame for display
+                    df = pd.DataFrame(opps)
+                    if not df.empty:
+                        lines.append(format_df_for_printout(df, True))
+                else:
+                    lines.append("\nNo arbitrage opportunities detected")
+        
+        return "\n".join(lines)
+
+    def _create_controller(self, config: ControllerConfigBase):
+        """Create a controller instance."""
+        return config.get_controller_class()(
+            config=config,
+            market_data_provider=self.market_data_provider,
+            actions_queue=self.actions_queue
+        )
+
+    def update_controllers_configs(self):
+        """Use our stored strategy_config instead of self.config"""
+        if not hasattr(self, '_last_config_update_ts'):
+            self._last_config_update_ts = 0
+        
+        if hasattr(self, 'strategy_config') and self._last_config_update_ts + self.strategy_config.config_update_interval < self.current_timestamp:
+            self._last_config_update_ts = self.current_timestamp
+            
+            # Create controller config manually since we know the structure
+            controller_config = ArbitrageControllerConfig(
+                controller_name="arbitrage_controller",
+                controller_type="arbitrage",
+                connector1=self.strategy_config.connector1,
+                connector2=self.strategy_config.connector2,
+                min_profitability=self.strategy_config.min_profitability,
+                order_amount=self.strategy_config.order_amount,
+                cooldown_time=self.strategy_config.cooldown_time,
+                max_concurrent_positions=self.strategy_config.max_concurrent_positions,
+                trading_pair=self.strategy_config.trading_pair,
+                config_update_interval=self.strategy_config.config_update_interval
+            )
+            
+            # Update existing controller
+            if "arbitrage_controller" in self.controllers:
+                self.controllers["arbitrage_controller"].update_config(controller_config)
 
 
-def start():
+def start(config_file_name=None):
     """
     Main entry point for the strategy.
     """
-    config = ArbitrageStrategyConfig()
-    ArbitrageStrategy.init_markets(config)  # Initialize markets before creating strategy
-    strategy = ArbitrageStrategy(config=config)
+    import asyncio
+    import time
+    
+    # Initialize logging first
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(settings.LOG_FILE_PATH, "hummingbot_logs.yml")),
+            logging.StreamHandler()
+        ]
+    )
+    
+    # Get the main Hummingbot application
+    hb = HummingbotApplication.main_application()
+    
+    # Load config from file or create default config
+    if config_file_name is not None:
+        config_path = os.path.join(settings.STRATEGY_CONF_DIR, config_file_name)
+        if not os.path.exists(config_path):
+            config_path = os.path.join(settings.CONF_DIR, "scripts", config_file_name)
+        
+        with open(config_path) as file:
+            config_dict = yaml.safe_load(file)
+        config = ArbitrageStrategyConfig.parse_obj(config_dict)
+    else:
+        config = ArbitrageStrategyConfig()
+    
+    # Patch the Security.decrypt_connector_config method to avoid errors
+    original_decrypt_connector_config = Security.decrypt_connector_config
+    
+    def safe_decrypt_connector_config(cls, file_path):
+        try:
+            original_decrypt_connector_config(file_path)
+        except Exception as e:
+            logging.getLogger("hummingbot.client.config.security").warning(
+                f"Failed to decrypt connector config for {file_path}: {str(e)}")
+    
+    # Apply the patch
+    Security.decrypt_connector_config = classmethod(safe_decrypt_connector_config)
+    
+    # Get only connectors that are already connected and initialized
+    connectors = {}
+    ready_connectors = set()
+    max_wait_time = 30  # seconds
+    start_time = time.time()
+    
+    # First check if connectors are available
+    for connector_name in [config.connector1, config.connector2]:
+        if connector_name not in hb.markets:
+            logging.getLogger(__name__).error(
+                f"Connector {connector_name} not found. Make sure you've added it with 'connect {connector_name}'")
+            return
+    
+    # Wait for connectors to be ready
+    print(f"Waiting for connectors to be ready (max {max_wait_time} seconds)...")
+    while time.time() - start_time < max_wait_time:
+        pending_connectors = []
+        
+        for connector_name in [config.connector1, config.connector2]:
+            if connector_name in ready_connectors:
+                continue
+                
+            if hb.markets[connector_name].ready:
+                connectors[connector_name] = hb.markets[connector_name]
+                ready_connectors.add(connector_name)
+                print(f"✓ Connector {connector_name} is ready")
+            else:
+                pending_connectors.append(connector_name)
+        
+        if not pending_connectors:
+            # All connectors are ready
+            break
+            
+        # Print status but don't spam the logs
+        if len(pending_connectors) > 0:
+            print(f"Waiting for: {', '.join(pending_connectors)}...")
+            
+        time.sleep(1)
+    
+    # Check if all connectors are ready
+    if len(ready_connectors) < 2:
+        not_ready = set([config.connector1, config.connector2]) - ready_connectors
+        print(f"Timed out waiting for connectors: {', '.join(not_ready)}")
+        print("Please ensure the exchanges are properly configured and try again.")
+        return
+    
+    # Initialize markets for the strategy
+    ArbitrageStrategy.init_markets(config)
+    
+    # Create the strategy with only successfully connected connectors
+    strategy = ArbitrageStrategy(connectors=connectors, config=config)
+    
+    # Restore original method
+    Security.decrypt_connector_config = original_decrypt_connector_config
+    
     return strategy
