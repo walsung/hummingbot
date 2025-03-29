@@ -2,6 +2,7 @@ import logging
 import pandas as pd
 import numpy as np
 import time
+import asyncio
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.event.events import (
@@ -23,29 +24,64 @@ from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import OrderType, TradeType
 from hummingbot.core.data_type import common
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-from hummingbot.strategy_v2.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.connector.connector_base import ConnectorBase
 from enum import Enum
+from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+from hummingbot.core.api_throttler.data_types import RateLimit
 
 class PositionMode(Enum):
     HEDGE = "Hedge"
     ONEWAY = "OneWay"
 
-class Rebalance_example(ScriptStrategyBase):
+class Rebalance_perpetual(ScriptStrategyBase):
     """
     This strategy is used to rebalance a perpetual position.
     """
-    #connector_name = "binance_perpetual"
-    connector_name = "binance_paper_trade"
+    #connector_name = "binance_perpetual"    # "binance_paper_trade"
+    connector_name = "bybit_perpetual"
     last_ordered_ts = 0
 
     trading_pair = [
-      "BERA-USDT", 
-      "TON-USDT", 
-      "XRP-USDT"
+      "BERA-USDT",
+      "DOGE-USDT",
+      # "LDOM-USDT",
+      "GALA-USDT",
+      "1000PEPE-USDT",
+      "MEME-USDT",
+      "OP-USDT",
+      "INJ-USDT",
+      "ADA-USDT",
+      "ORDI-USDT",
+      # "MATIC-USDT",
+      "NEAR-USDT",
+      "SEI-USDT",
+      "ICP-USDT",
+      "WLD-USDT",
+      "BSV-USDT",
+      "BNB-USDT",
+      "AVAX-USDT",
+      "ETH-USDT",
+      "ALGO-USDT",
+      "TIA-USDT",
+      "BTC-USDT",
+      "SOL-USDT",
+      "TON-USDT",
+      "SUN-USDT",
+      # "BOND-USDT",
+      "ALPACA-USDT",
+      # "REEF-USDT",
+      "RARE-USDT",
+      "REZ-USDT",
+      # "DDGS-USDT",
+      "TRX-USDT",
+      "XRP-USDT",
+      "UNI-USDT",
+      "PNUT-USDT",
+      "SUI-USDT"
     ]
     # strategy specific variables
     rb: Dict = {
@@ -72,7 +108,7 @@ class Rebalance_example(ScriptStrategyBase):
     set_leverage_flag = False
 
     # leverage parameters 
-    leverage = 20
+    leverage = 4
     max_leverage = 4
     min_leverage = 2
     
@@ -104,7 +140,7 @@ class Rebalance_example(ScriptStrategyBase):
       "TON-USDT": Decimal("1"),
       "SUN-USDT": Decimal("130"),
       "BOND-USDT": Decimal("2.6"),
-      "ALPACA-USOT": Decimal("23"),
+      "ALPACA-USDT": Decimal("23"),
       "REEF-USDT": Decimal("5189"),
       "RARE-USDT": Decimal("21"),
       "REZ-USDT": Decimal("97"),
@@ -125,6 +161,15 @@ class Rebalance_example(ScriptStrategyBase):
         super().__init__(connectors)
         # is necessary to start the candle feed
         self.check_and_set_leverage()
+        
+        # Create throttler with Bybit's specific rate limits
+        self.throttler = AsyncThrottler(
+            rate_limits=[
+                # Global rate limits
+                RateLimit(limit_id="GET", limit=40, time_interval=1.0),  # 40 GET requests per second (conservative)
+                RateLimit(limit_id="POST", limit=15, time_interval=1.0),  # 15 POST requests per second (conservative)
+            ]
+        )
 
     def check_and_set_leverage(self):
         if not self.set_leverage_flag:
@@ -160,11 +205,8 @@ class Rebalance_example(ScriptStrategyBase):
                 self.init_rebalance()
             elif self.rb["status"] == "ACTIVATE":
                 try:
-                    self.cancel_all_order()
-                    time.sleep(1)
-                    self.get_balance()
-                    time.sleep(1)
-                    self.create_order()
+                    # Use safe_ensure_future to run these operations with rate limiting
+                    safe_ensure_future(self.rate_limited_operations())
                 except Exception as e:
                     self.logger().error(f"Error in on_tick: {str(e)}")
             self.last_ordered_ts = self.current_timestamp                
@@ -183,14 +225,23 @@ class Rebalance_example(ScriptStrategyBase):
     def get_balance(self):
         """
         get the current balance status:
-        1. retrieve usdt balance
+        1. retrieve balance
         2. get all trading pair status
         3. calculate every trading pair value
         4. calculate the gain/loss
         """
         print("retrieve order amount")
         balance = self.get_balance_df()
-        self.get_balance = Decimal(float(balance.loc[balance['Asset'] == "USDT", 'Total Balance']))
+        
+        # Fix the Series to float conversion error
+        usdt_balance = balance.loc[balance['Asset'] == "USDT", 'Total Balance']
+        if not usdt_balance.empty:
+            self.balance = Decimal(float(usdt_balance.iloc[0]))
+        else:
+            self.logger().warning("USDT balance not found")
+            self.balance = Decimal("0")
+        
+        # Get all positions
         df1 = self.connectors[self.rb["connector_name"]].account_positions
         total_unrealized_pnl = 0
         total_asset_value = 0
@@ -206,7 +257,7 @@ class Rebalance_example(ScriptStrategyBase):
             self.price[tp] = price
             self.asset_value[tp] = amount * price
             total_asset_value = self.asset_value[tp]
-            total_unrealized_pnl = unrealized_pnl + total_unrealized_pnl 
+            total_unrealized_pnl = unrealized_pnl + total_unrealized_pnl
 
     def create_order(self):
         """
@@ -223,7 +274,7 @@ class Rebalance_example(ScriptStrategyBase):
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT_MAKER,
+                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
                     self.price[tp] * Decimal("1.001"),
                     common.PositionAction.CLOSE
                 )
@@ -233,7 +284,7 @@ class Rebalance_example(ScriptStrategyBase):
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT_MAKER,
+                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
                     self.price[tp] * Decimal("0.9999"),
                     common.PositionAction.OPEN
                 )
@@ -243,7 +294,7 @@ class Rebalance_example(ScriptStrategyBase):
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT_MAKER,
+                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
                     self.price[tp] * Decimal("1.005"),
                     common.PositionAction.CLOSE
                 )
@@ -251,7 +302,7 @@ class Rebalance_example(ScriptStrategyBase):
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT_MAKER,
+                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
                     self.price[tp] * Decimal("0.9949"),
                     common.PositionAction.OPEN
                 )
@@ -315,70 +366,25 @@ class Rebalance_example(ScriptStrategyBase):
         df.sort_values(by=["Exchange", "Trading Pair"], inplace=True)    
         return df
 
-         
-        # Process each trading pair in our strategy
-        for tp in self.trading_pair:
-            position_pair = tp + "LONG"
+    async def rate_limited_operations(self):
+        """Run operations with rate limiting to avoid API limits"""
+        try:
+            # Cancel all orders (POST operation)
+            async with self.throttler.execute_task(limit_id="POST"):
+                self.cancel_all_order()
             
-            # Default values
-            amount = Decimal("0")
-            entry_price = Decimal("0")
-            unrealized_pnl = Decimal("0")
-# """ 
-#     """ 
-#     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
-#         """
-#         Handle buy order created event
-#         """
-#         self.logger().info(f"Buy order {event.order_id} created for {event.trading_pair} at {event.price}")
-#         # Update the active order tracking
-#         self.activate_order_id[event.order_id] = {
-#             "trading_pair": event.trading_pair,
-#             "price": event.price,
-#             "amount": event.amount,
-#             "type": "BUY",
-#             "timestamp": self.current_timestamp
-#         }
-
-#     def did_create_sell_order(self, event: SellOrderCreatedEvent):
-#         """
-#         Handle sell order created event
-#         """
-#         self.logger().info(f"Sell order {event.order_id} created for {event.trading_pair} at {event.price}")
-#         # Update the active order tracking
-#         self.activate_order_id[event.order_id] = {
-#             "trading_pair": event.trading_pair,
-#             "price": event.price,
-#             "amount": event.amount,
-#             "type": "SELL",
-#             "timestamp": self.current_timestamp
-#         }
-    
-#     def did_fill_order(self, event: OrderFilledEvent):
-#         """
-#         Handle order filled events to track position changes
-#         """
-#         order_id = event.order_id
-#         if order_id in self.activate_order_id:
-#             order_data = self.activate_order_id[order_id]
-#             fill_price = event.price
-#             fill_amount = event.amount
+            # Wait between operations
+            await asyncio.sleep(2)
             
-#             # Log the fill
-#             self.logger().info(
-#                 f"Order {order_id} filled: {order_data['type']} {fill_amount} {order_data['trading_pair']} @ {fill_price}"
-#             )
+            # Get balance (GET operation)
+            async with self.throttler.execute_task(limit_id="GET"):
+                self.get_balance()
             
-#             # Update position tracking
-#             trading_pair = order_data['trading_pair']
+            # Wait between operations
+            await asyncio.sleep(2)
             
-#             # Force refresh of position data on next tick
-#             self.last_ordered_ts = 0
-            
-#             # Remove from active orders
-#             if event.trade_type == TradeType.BUY:
-#                 self.logger().info(f"Increased position in {trading_pair}")
-#             else:
-#                 self.logger().info(f"Decreased position in {trading_pair}")
-#  """
-# # '''     """
+            # Create order (POST operation)
+            async with self.throttler.execute_task(limit_id="POST"):
+                self.create_order()
+        except Exception as e:
+            self.logger().error(f"Error in rate_limited_operations: {str(e)}")
