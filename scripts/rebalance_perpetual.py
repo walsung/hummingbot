@@ -2,6 +2,7 @@
 bybit_perpetual only has OrderType.LIMIT and MAKER, doesn't have LIMIT_MAKER
 
 connector_name = bybit  doesn't support many crypto pairs. Has to be bybit_perpetual
+https://hummingbot.org/exchanges/bybit/#perp-connector
 """
 
 import logging
