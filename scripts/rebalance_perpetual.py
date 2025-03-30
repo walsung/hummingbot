@@ -1,8 +1,15 @@
+"""
+bybit_perpetual only has OrderType.LIMIT and MAKER, doesn't have LIMIT_MAKER
+
+connector_name = bybit  doesn't support many crypto pairs. Has to be bybit_perpetual
+"""
+
 import logging
 import pandas as pd
 import numpy as np
 import time
 import asyncio
+import random
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.event.events import (
@@ -81,7 +88,20 @@ class Rebalance_perpetual(ScriptStrategyBase):
       "XRP-USDT",
       "UNI-USDT",
       "PNUT-USDT",
-      "SUI-USDT"
+      "SUI-USDT",
+      "MNT-USDT",
+      "ENA-USDT",
+      "JUP-USDT",
+      "WIF-USDT",
+      # "BONK-USDT",
+      # "FLOKI-USDT",
+      #"SHIB-USDT",
+     # "AMI-USDT",
+      "VVV-USDT",
+      "BANANAS31-USDT",
+      # "KILO-USDT",
+      "WAL-USDT"
+      # "B3TR-USDT"
     ]
     # strategy specific variables
     rb: Dict = {
@@ -135,7 +155,7 @@ class Rebalance_perpetual(ScriptStrategyBase):
       "ETH-USDT": Decimal("0.01"),
       "ALGO-USDT": Decimal("10"),
       "TIA-USDT": Decimal("1"),
-      "BTC-USDT": Decimal("0.001"),
+      "BTC-USDT": Decimal("0.0001"),
       "SOL-USDT": Decimal("1"),
       "TON-USDT": Decimal("1"),
       "SUN-USDT": Decimal("130"),
@@ -147,10 +167,23 @@ class Rebalance_perpetual(ScriptStrategyBase):
       "DDGS-USDT": Decimal("3976"),
       "TRX-USDT": Decimal("32"),
       "XRP-USDT": Decimal("9.4"),
-      "ADA-USDT": Decimal("15"),
       "UNI-USDT": Decimal("1"),
       "PNUT-USDT": Decimal("4"),
       "SUI-USDT": Decimal("1.4"),
+      "MNT-USDT": Decimal("741"),
+      "ENA-USDT": Decimal("1.1"),
+      "JUP-USDT": Decimal("0.8"),
+      "WIF-USDT": Decimal("5"),
+      "BONK-USDT": Decimal("24331"),
+      "FLOKI-USDT": Decimal("4367"),
+      "SHIB-USDT": Decimal("24330"),
+      "AMI-USDT": Decimal("10"),      # AMI: Min Transaction Limit = 10
+    # 2025 March -- Newer pairs (not in Convert list, inferred from Spot Trading Rules)
+      "VVV-USDT": Decimal("1"),       # Default to 1 USDT notional value (Source 5)
+      "BANANAS31-USDT": Decimal("1"), # Unlisted; use 1 USDT equivalent
+      "KILO-USDT": Decimal("1"),      # Unlisted; use 1 USDT equivalent
+      "WAL-USDT": Decimal("1"),       # Unlisted; use 1 USDT equivalent
+      "B3TR-USDT": Decimal("7")       # From Convert list (B3TR: Min = 7)
     }
 
     @property
@@ -159,29 +192,77 @@ class Rebalance_perpetual(ScriptStrategyBase):
 
     def __init__(self, connectors: Dict[str, ConnectorBase]):
         super().__init__(connectors)
-        # is necessary to start the candle feed
+        
+        # Validate trading pairs before anything else
+        self.validate_trading_pairs()
+        
+        # Set leverage after validation
         self.check_and_set_leverage()
         
-        # Create throttler with Bybit's specific rate limits
+        # Create throttler with Bybit's specific rate limits - even more conservative
         self.throttler = AsyncThrottler(
             rate_limits=[
-                # Global rate limits
-                RateLimit(limit_id="GET", limit=40, time_interval=1.0),  # 40 GET requests per second (conservative)
-                RateLimit(limit_id="POST", limit=15, time_interval=1.0),  # 15 POST requests per second (conservative)
+                # Global rate limits - reduced to be more conservative
+                RateLimit(limit_id="GET", limit=20, time_interval=1.0),  # 20 GET requests per second
+                RateLimit(limit_id="POST", limit=5, time_interval=1.0),  # 5 POST requests per second
             ]
         )
+
+    def validate_trading_pairs(self):
+        """Validate trading pairs before any other operations"""
+        perp_connector = self.connector
+        valid_trading_pairs = []
+        
+        # Get all available trading pairs from the exchange
+        all_exchange_trading_pairs = perp_connector._trading_pairs
+        self.logger().info(f"Available trading pairs on {self.connector_name}: {all_exchange_trading_pairs}")
+        
+        # Filter our trading pairs list to only include valid ones
+        for trading_pair in self.trading_pair:
+            try:
+                # Try to get the exchange symbol - this will fail if the pair doesn't exist
+                exchange_symbol = perp_connector.exchange_symbol_associated_to_pair(trading_pair)
+                valid_trading_pairs.append(trading_pair)
+                self.logger().info(f"Validated trading pair: {trading_pair}")
+            except Exception as e:
+                self.logger().warning(f"Trading pair {trading_pair} not available on {self.connector_name}: {str(e)}. Skipping.")
+        
+        # Update trading_pair list with only valid pairs
+        self.trading_pair = valid_trading_pairs
+        self.rb["trading_pair"] = valid_trading_pairs
+        self.markets = {self.rb["connector_name"]: valid_trading_pairs}
+        
+        # Also update min_amount dictionary to only include valid pairs
+        valid_min_amounts = {}
+        for pair in valid_trading_pairs:
+            if pair in self.min_amount:
+                valid_min_amounts[pair] = self.min_amount[pair]
+        self.min_amount = valid_min_amounts
+        
+        self.logger().info(f"Using {len(valid_trading_pairs)} valid trading pairs: {valid_trading_pairs}")
 
     def check_and_set_leverage(self):
         if not self.set_leverage_flag:
             perp_connector = self.connector
-            perp_connector.set_position_mode(PositionMode.HEDGE)
-            for trading_pair in self.trading_pair:
-                perp_connector.set_leverage(
-                    trading_pair=trading_pair, leverage=self.leverage
+            try:
+                perp_connector.set_position_mode(PositionMode.HEDGE)
+                
+                # Set leverage for each validated trading pair
+                for trading_pair in self.trading_pair:
+                    try:
+                        perp_connector.set_leverage(
+                            trading_pair=trading_pair, leverage=self.leverage
+                        )
+                        self.logger().info(f"Set leverage to {self.leverage} for {trading_pair}")
+                    except Exception as e:
+                        self.logger().warning(f"Error setting leverage for {trading_pair}: {str(e)}")
+                
+                self.logger().info(
+                    f"Leverage setting completed for {len(self.trading_pair)} trading pairs"
                 )
-            self.logger().info(
-                f"Setting leverage to {self.leverage} for {perp_connector} on {self.trading_pair}"
-            )
+            except Exception as e:
+                self.logger().error(f"Error setting position mode: {str(e)}")
+            
             self.set_leverage_flag = True
     
     def on_tick(self):
@@ -267,45 +348,62 @@ class Rebalance_perpetual(ScriptStrategyBase):
         3. if within the threshold, then create both buy and sell orders
         """
         rb = self.rb.copy()
+        # Process only 5 trading pairs at a time to avoid rate limits
+        processed_pairs = 0
+        max_pairs_per_cycle = 5
+        
         for tp in self.asset_value:
+            if processed_pairs >= max_pairs_per_cycle:
+                break
+            
             if self.asset_value[tp] >= rb["target_value"] * (1 + rb["threshold"]):
                 # sell order: when position value is high
                 self.sell(
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
+                    OrderType.LIMIT,
                     self.price[tp] * Decimal("1.001"),
                     common.PositionAction.CLOSE
                 )
+                processed_pairs += 1
+                time.sleep(0.5)  # Add delay between orders
+            
             elif self.asset_value[tp] < rb["target_value"] * (1 - rb["threshold"]):
                 # open order: when position value is low
                 self.buy(
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
+                    OrderType.LIMIT,
                     self.price[tp] * Decimal("0.9999"),
                     common.PositionAction.OPEN
                 )
+                processed_pairs += 1
+                time.sleep(0.5)  # Add delay between orders
+            
             else:
-                # within the threshold, sell and buy
-                self.sell(
-                    self.rb["connector_name"], 
-                    tp,
-                    max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
-                    self.price[tp] * Decimal("1.005"),
-                    common.PositionAction.CLOSE
-                )
-                self.buy(
-                    self.rb["connector_name"], 
-                    tp,
-                    max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT,  # Changed from LIMIT_MAKER to LIMIT
-                    self.price[tp] * Decimal("0.9949"),
-                    common.PositionAction.OPEN
-                )
+                # Only place one order (not both) to reduce API calls
+                if random.choice([True, False]):
+                    self.sell(
+                        self.rb["connector_name"], 
+                        tp,
+                        max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
+                        OrderType.LIMIT,
+                        self.price[tp] * Decimal("1.005"),
+                        common.PositionAction.CLOSE
+                    )
+                else:
+                    self.buy(
+                        self.rb["connector_name"], 
+                        tp,
+                        max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
+                        OrderType.LIMIT,
+                        self.price[tp] * Decimal("0.9949"),
+                        common.PositionAction.OPEN
+                    )
+                processed_pairs += 1
+                time.sleep(0.5)  # Add delay between orders
                 
     # format output
     def format_status(self) -> str:
@@ -373,15 +471,15 @@ class Rebalance_perpetual(ScriptStrategyBase):
             async with self.throttler.execute_task(limit_id="POST"):
                 self.cancel_all_order()
             
-            # Wait between operations
-            await asyncio.sleep(2)
+            # Longer wait between operations
+            await asyncio.sleep(5)
             
             # Get balance (GET operation)
             async with self.throttler.execute_task(limit_id="GET"):
                 self.get_balance()
             
-            # Wait between operations
-            await asyncio.sleep(2)
+            # Longer wait between operations
+            await asyncio.sleep(5)
             
             # Create order (POST operation)
             async with self.throttler.execute_task(limit_id="POST"):
