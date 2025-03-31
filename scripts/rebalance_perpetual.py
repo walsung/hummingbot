@@ -53,6 +53,8 @@ class Rebalance_perpetual(ScriptStrategyBase):
     connector_name = "bybit_perpetual"
     last_ordered_ts = 0
 
+
+  # 2025-03-30 -- bybit perpetual -- Newer pairs (not in Convert list, inferred from Spot Trading Rules)
     trading_pair = [
       "BERA-USDT",
       "DOGE-USDT",
@@ -101,8 +103,76 @@ class Rebalance_perpetual(ScriptStrategyBase):
       "VVV-USDT",
       "BANANAS31-USDT",
       # "KILO-USDT",
-      "WAL-USDT"
+      "WAL-USDT",
       # "B3TR-USDT"
+      # ---- USDC pairs ------ #
+      'BNB-USDC', 
+      'BTC-USDC', 
+      'ETH-USDC', 
+      'XRP-USDC', 
+      # 'EOS-USDC', 
+      'XLM-USDC', 
+      'LINK-USDC', 
+      # 'LTC-USDC',
+      # 'TRX-USDC', 
+      # 'ADA-USDC', 
+      # 'NEO-USDC', 
+      # 'ATOM-USDC', 
+      # 'ALGO-USDC', 
+      'DOGE-USDC', 
+      # 'ONT-USDC', 
+      # 'BCH-USDC',
+      'SOL-USDC', 
+      'ARB-USDC', 
+      # 'AVAX-USDC', 
+      'DOT-USDC', 
+      # 'INJ-USDC', 
+      'OP-USDC', 
+      'ORDI-USDC', 
+      'SUI-USDC',
+      'TIA-USDC', 
+      # 'MANTA-USDC', 
+      # 'BLUR-USDC', 
+      # 'ALT-USDC', 
+      # 'SEI-USDC', 
+      # 'JUP-USDC', 
+      # 'FIL-USDC', 
+      'WLD-USDC',
+      # 'UNI-USDC', 
+      # 'PIXEL-USDC', 
+      'STRK-USDC', 
+      # 'PEPE-USDC', 
+      # 'SHIB-USDC', 
+      # 'NEAR-USDC', 
+      # 'FET-USDC',
+      # 'EUR-USDC', 
+      # 'BONK-USDC', 
+      # 'FLOKI-USDC', 
+      # 'PENDLE-USDC', 
+      # 'BOME-USDC', 
+      # 'JTO-USDC', 
+      'WIF-USDC',
+      # 'CKB-USDC', 
+      'ENA-USDC', 
+      'ETHFI-USDC', 
+      # 'YGG-USDC', 
+      # 'CFX-USDC', 
+      # 'RUNE-USDC', 
+      # 'SAGA-USDC',
+      # 'APT-USDC', 
+      # 'GALA-USDC', 
+      # 'STX-USDC', 
+      # 'ICP-USDC', 
+      # 'OMNI-USDC', 
+      # 'TRB-USDC',
+      # 'ARKM-USDC', 
+      # "EURI-USDC", 
+      # "SYN-USDC", 
+      # "VELODROME-USDC", 
+      # "HBAR-USDC", 
+      "POL-USDC", 
+      # "SUSHI-USDC",
+      # "CVC-USDC"  # kraken and binance pair
     ]
     # strategy specific variables
     rb: Dict = {
@@ -184,7 +254,75 @@ class Rebalance_perpetual(ScriptStrategyBase):
       "BANANAS31-USDT": Decimal("1"), # Unlisted; use 1 USDT equivalent
       "KILO-USDT": Decimal("1"),      # Unlisted; use 1 USDT equivalent
       "WAL-USDT": Decimal("1"),       # Unlisted; use 1 USDT equivalent
-      "B3TR-USDT": Decimal("7")       # From Convert list (B3TR: Min = 7)
+      "B3TR-USDT": Decimal("7"),       # From Convert list (B3TR: Min = 7)
+      # USDC pairs
+      'BNB-USDC': Decimal("0.01"),      # Min order size: 0.01 BNB
+      'BTC-USDC': Decimal("0.0001"),    # Min order size: 0.0001 BTC
+      'ETH-USDC': Decimal("0.001"),     # Min order size: 0.001 ETH
+      'XRP-USDC': Decimal("10"),        # Min order size: 10 XRP
+      'EOS-USDC': Decimal("1"),         # Min order size: 1 EOS
+      'XLM-USDC': Decimal("10"),        # Min order size: 10 XLM
+      'LINK-USDC': Decimal("0.1"),      # Min order size: 0.1 LINK
+      'LTC-USDC': Decimal("0.01"),      # Min order size: 0.01 LTC
+      'TRX-USDC': Decimal("100"),       # Min order size: 100 TRX
+      'ADA-USDC': Decimal("10"),        # Min order size: 10 ADA
+      'NEO-USDC': Decimal("0.1"),       # Min order size: 0.1 NEO
+      'ATOM-USDC': Decimal("0.1"),      # Min order size: 0.1 ATOM
+      'ALGO-USDC': Decimal("10"),       # Min order size: 10 ALGO
+      'DOGE-USDC': Decimal("100"),      # Min order size: 100 DOGE
+      'ONT-USDC': Decimal("10"),        # Min order size: 10 ONT
+      'BCH-USDC': Decimal("0.01"),      # Min order size: 0.01 BCH
+      'SOL-USDC': Decimal("0.1"),       # Min order size: 0.1 SOL
+      'ARB-USDC': Decimal("1"),         # Min order size: 1 ARB
+      'AVAX-USDC': Decimal("0.1"),      # Min order size: 0.1 AVAX
+      'DOT-USDC': Decimal("0.1"),       # Min order size: 0.1 DOT
+      'INJ-USDC': Decimal("0.1"),       # Min order size: 0.1 INJ
+      'OP-USDC': Decimal("1"),          # Min order size: 1 OP
+      'ORDI-USDC': Decimal("0.01"),     # Min order size: 0.01 ORDI
+      'SUI-USDC': Decimal("1"),         # Min order size: 1 SUI
+      'TIA-USDC': Decimal("0.1"),       # Min order size: 0.1 TIA
+      'MANTA-USDC': Decimal("1"),       # Min order size: 1 MANTA
+      'BLUR-USDC': Decimal("10"),       # Min order size: 10 BLUR
+      'ALT-USDC': Decimal("10"),        # Min order size: 10 ALT
+      'SEI-USDC': Decimal("10"),        # Min order size: 10 SEI
+      'JUP-USDC': Decimal("10"),        # Min order size: 10 JUP
+      'FIL-USDC': Decimal("0.1"),       # Min order size: 0.1 FIL
+      'WLD-USDC': Decimal("1"),         # Min order size: 1 WLD
+      'UNI-USDC': Decimal("0.1"),       # Min order size: 0.1 UNI
+      'PIXEL-USDC': Decimal("10"),      # Min order size: 10 PIXEL
+      'STRK-USDC': Decimal("1"),        # Min order size: 1 STRK
+      'PEPE-USDC': Decimal("50000"),    # Min order size: ~$10 at current prices (varies)
+      'SHIB-USDC': Decimal("100000"),   # Min order size: ~$10 at current prices
+      'NEAR-USDC': Decimal("1"),        # Min order size: 1 NEAR
+      'FET-USDC': Decimal("10"),        # Min order size: 10 FET
+      'EUR-USDC': Decimal("10"),        # Min order size: 10 EUR (stablecoin)
+      'BONK-USDC': Decimal("100000"),   # Min order size: ~$10 at current prices
+      'FLOKI-USDC': Decimal("10000"),   # Min order size: ~$10 at current prices
+      'PENDLE-USDC': Decimal("1"),      # Min order size: 1 PENDLE
+      'BOME-USDC': Decimal("10000"),    # Min order size: ~$10 at current prices
+      'JTO-USDC': Decimal("1"),         # Min order size: 1 JTO
+      'WIF-USDC': Decimal("10"),        # Min order size: 10 WIF
+      'CKB-USDC': Decimal("1000"),      # Min order size: 1000 CKB
+      'ENA-USDC': Decimal("10"),        # Min order size: 10 ENA
+      'ETHFI-USDC': Decimal("1"),       # Min order size: 1 ETHFI
+      'YGG-USDC': Decimal("10"),        # Min order size: 10 YGG
+      'CFX-USDC': Decimal("10"),        # Min order size: 10 CFX
+      'RUNE-USDC': Decimal("1"),        # Min order size: 1 RUNE
+      'SAGA-USDC': Decimal("1"),        # Min order size: 1 SAGA
+      'APT-USDC': Decimal("0.1"),       # Min order size: 0.1 APT
+      'GALA-USDC': Decimal("100"),      # Min order size: 100 GALA
+      'STX-USDC': Decimal("1"),         # Min order size: 1 STX
+      'ICP-USDC': Decimal("0.1"),       # Min order size: 0.1 ICP
+      'OMNI-USDC': Decimal("1"),        # Min order size: 1 OMNI
+      'TRB-USDC': Decimal("0.1"),       # Min order size: 0.1 TRB
+      'ARKM-USDC': Decimal("1"),        # Min order size: 1 ARKM
+      "EURI-USDC": Decimal("10"),       # Min order size: 10 EURI
+      "SYN-USDC": Decimal("10"),        # Min order size: 10 SYN
+      "VELODROME-USDC": Decimal("10"),   # Min order size: 10 VELO
+      "HBAR-USDC": Decimal("10"),        # Min order size: 10 HBAR
+      "POL-USDC": Decimal("1"),          # Min order size: 1 POL
+      "SUSHI-USDC": Decimal("1"),        # Min order size: 1 SUSHI
+      "CVC-USDC": Decimal("100")        # Min order size: 100 CVC
     }
 
     @property
