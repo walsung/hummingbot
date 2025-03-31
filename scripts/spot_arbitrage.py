@@ -11,6 +11,7 @@ import numpy as np
 import time
 import asyncio
 import random
+from datetime import datetime
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.event.events import (
@@ -39,48 +40,76 @@ class SpotArbitrage(ScriptStrategyBase):
     This strategy monitors price differences between the same trading pair on two exchanges
     and executes arbitrage trades when profitable opportunities arise.
     """
+    # Define common trading pairs for both exchanges
+    common_trading_pairs = [
+        # "BERA-USDT",
+        # "DOGE-USDT",
+        # "GALA-USDT",
+        # "MEME-USDT",
+        # "OP-USDT",
+        # "INJ-USDT",
+        # "ADA-USDT",
+        # "ORDI-USDT",
+        # "NEAR-USDT",
+        # "SEI-USDT",
+        # "ICP-USDT",
+        # "WLD-USDT",
+        # "BNB-USDT",
+        # "AVAX-USDT",
+        # "ETH-USDT",
+        # "ALGO-USDT",
+        # "TIA-USDT",
+        # "BTC-USDT",
+        # "SOL-USDT",
+        # "TON-USDT",
+        # "SUN-USDT",
+        # # "ALPACA-USDT",
+        # # "RARE-USDT",
+        # # "REZ-USDT",
+        # "TRX-USDT",
+        # "XRP-USDT",
+        # "UNI-USDT",
+        # "PNUT-USDT",
+        # "SUI-USDT",
+        # "ENA-USDT",
+        # "JUP-USDT",
+        # "WIF-USDT",
+        # "BANANAS31-USDT",
+      #  "WAL-USDT",
+        "BNB-USDC",
+        "BCH-USDC",
+        "NEAR-USDC",
+        "WIF-USDC",
+        "BONK-USDC",
+        "SOL-USDC",
+        "XRP-USDC",
+        "ADA-USDC",
+        "AVAX-USDC",
+        "TON-USDC"
+        
+    ]
+    
     # Define exchanges and trading pairs
     exchange_configs = {
         "binance": {
-            "trading_pairs": [
-                "BTC-USDT",
-                "ETH-USDT",
-                "SOL-USDT",
-                "BNB-USDT",
-                "XRP-USDT",
-                "DOGE-USDT",
-                "ADA-USDT",
-                "AVAX-USDT",
-                "MATIC-USDT",
-                "DOT-USDT"
-            ],
             "min_profitability": Decimal("0.005"),  # 0.5% minimum profitability
             "order_amount_usd": Decimal("20"),      # Order size in USD
             "max_order_age": 60,                    # Max order age in seconds
         },
         "bybit": {
-            "trading_pairs": [
-                "BTC-USDT",
-                "ETH-USDT",
-                "SOL-USDT",
-                "BNB-USDT",
-                "XRP-USDT",
-                "DOGE-USDT",
-                "ADA-USDT",
-                "AVAX-USDT",
-                "MATIC-USDT",
-                "DOT-USDT"
-            ],
             "min_profitability": Decimal("0.005"),  # 0.5% minimum profitability
             "order_amount_usd": Decimal("20"),      # Order size in USD
             "max_order_age": 60,                    # Max order age in seconds
         }
     }
     
+    # Arbitrage threshold (percentage)
+    THRESHOLD = Decimal("0.1")  # value 1 = 1% price difference threshold,  0.1 = 0.1% price difference threshold
+    
     # Define markets as a class attribute
     markets = {}
-    for exchange, config in exchange_configs.items():
-        markets[exchange] = config["trading_pairs"]
+    for exchange in exchange_configs:
+        markets[exchange] = common_trading_pairs
     
     # Common variables
     last_checked_ts = 0
@@ -92,7 +121,7 @@ class SpotArbitrage(ScriptStrategyBase):
     arbitrage_opportunities = {}
     
     # Minimum order sizes for various trading pairs
-    min_order_amount = {
+    
     min_amount = {
       "BERA-USDT": Decimal("10"),
       "DOGE-USDT": Decimal("12"),
@@ -153,9 +182,6 @@ class SpotArbitrage(ScriptStrategyBase):
         self.exchange_data = {}
         self.instance_markets = {}
         
-        # Find common trading pairs between exchanges
-        self.common_trading_pairs = self.find_common_trading_pairs()
-        
         # Setup each exchange
         for exchange_name in self.exchange_configs:
             if exchange_name in connectors:
@@ -178,33 +204,20 @@ class SpotArbitrage(ScriptStrategyBase):
         self.throttlers = {
             "binance": AsyncThrottler(
                 rate_limits=[
-                    RateLimit(limit_id="GET", limit=20, time_interval=1.0),
-                    RateLimit(limit_id="POST", limit=10, time_interval=1.0),
+                    RateLimit(limit_id="GET", limit=40, time_interval=1.0),
+                    RateLimit(limit_id="POST", limit=15, time_interval=1.0),
                 ]
             ),
             "bybit": AsyncThrottler(
                 rate_limits=[
-                    RateLimit(limit_id="GET", limit=20, time_interval=1.0),
-                    RateLimit(limit_id="POST", limit=5, time_interval=1.0),
+                    RateLimit(limit_id="GET", limit=40, time_interval=1.0),
+                    RateLimit(limit_id="POST", limit=15, time_interval=1.0),
                 ]
             )
         }
         
         self.logger().info(f"Initialized SpotArbitrage strategy with {len(self.common_trading_pairs)} common trading pairs")
         self.logger().info(f"Common trading pairs: {self.common_trading_pairs}")
-    
-    def find_common_trading_pairs(self) -> List[str]:
-        """Find trading pairs that exist on both exchanges"""
-        common_pairs = []
-        
-        # Get trading pairs from both exchanges
-        binance_pairs = set(self.exchange_configs["binance"]["trading_pairs"])
-        bybit_pairs = set(self.exchange_configs["bybit"]["trading_pairs"])
-        
-        # Find intersection
-        common_pairs = list(binance_pairs.intersection(bybit_pairs))
-        
-        return common_pairs
     
     def validate_trading_pairs(self, exchange_name):
         """Validate trading pairs for a specific exchange"""
@@ -269,13 +282,12 @@ class SpotArbitrage(ScriptStrategyBase):
                     # Use throttler to respect rate limits
                     async with self.throttlers[exchange_name].execute_task(limit_id="GET"):
                         # Get mid price
-                        ticker = await connector.get_order_book(trading_pair)
-                        mid_price = (ticker.get_price(True) + ticker.get_price(False)) / Decimal("2")
+                        price = connector.get_mid_price(trading_pair)
                         
                         # Store price
                         if trading_pair not in self.prices:
                             self.prices[trading_pair] = {}
-                        self.prices[trading_pair][exchange_name] = mid_price
+                        self.prices[trading_pair][exchange_name] = price
                 except Exception as e:
                     self.logger().error(f"Error getting price for {trading_pair} on {exchange_name}: {str(e)}")
     
@@ -305,11 +317,8 @@ class SpotArbitrage(ScriptStrategyBase):
                 higher_exchange = "bybit"
                 lower_exchange = "binance"
             
-            # Check if the price difference exceeds minimum profitability
-            min_profitability = min(
-                self.exchange_data["binance"]["min_profitability"],
-                self.exchange_data["bybit"]["min_profitability"]
-            )
+            # Check if the price difference exceeds the threshold
+            min_profitability = self.THRESHOLD / Decimal("100")  # Convert percentage to decimal
             
             if price_diff_pct >= min_profitability:
                 self.arbitrage_opportunities[trading_pair] = {
@@ -357,7 +366,7 @@ class SpotArbitrage(ScriptStrategyBase):
                 base_amount = order_amount_usd / opportunity["higher_price"]
                 
                 # Ensure minimum order size
-                min_amount = self.min_order_amount.get(trading_pair, Decimal("0.001"))
+                min_amount = self.min_amount.get(trading_pair, Decimal("0.001"))
                 base_amount = max(base_amount, min_amount)
                 
                 # Execute trades
@@ -416,9 +425,22 @@ class SpotArbitrage(ScriptStrategyBase):
         if not self.ready:
             return "Market connectors are not ready."
         
+        # Format timestamps in UTC
+        current_time = datetime.utcfromtimestamp(self.current_timestamp).strftime('%Y-%m-%d %H:%M:%S UTC')
+        last_checked_time = datetime.utcfromtimestamp(self.last_checked_ts).strftime('%Y-%m-%d %H:%M:%S UTC')
+        
         lines = []
         lines.append("Spot Arbitrage Strategy")
         lines.append("---------------------")
+        lines.append(f"Current timestamp: {current_time}")
+        lines.append(f"Last checked timestamp: {last_checked_time}")
+        lines.append(f"Check interval: {self.check_interval} seconds")
+        lines.append(f"Ready: {self.ready}")
+        lines.append(f"Active orders: {len(self.active_orders)}")
+        lines.append(f"Arbitrage opportunities: {len(self.arbitrage_opportunities)}")
+        lines.append("--------------------------------")
+        lines.append(f"threshold is set to {self.THRESHOLD} %")
+        lines.append("--------------------------------")
         
         # Show current prices
         lines.append("\nCurrent Prices:")
@@ -462,4 +484,9 @@ class SpotArbitrage(ScriptStrategyBase):
     
     def did_complete_sell_order(self, event: SellOrderCompletedEvent):
         """Called when a sell order is completed"""
-        self.logger().info(f"Sell order completed: {event}") 
+        self.logger().info(f"Sell order completed: {event}")
+
+    @property
+    def ready(self):
+        """Check if all connectors are ready"""
+        return all(connector.ready for connector in self.connectors.values()) 
