@@ -1,223 +1,218 @@
 """
-Rebalance Perpetual Strategy
+StrategyV2 implementation for rebalancing perpetual futures positions.
+This strategy manages position sizes based on target values and thresholds.
 
-This strategy rebalances perpetual futures positions based on configured thresholds.
+Connector supported: bybit_perpetual
 """
 
 import logging
 import pandas as pd
+import numpy as np
 import time
 import asyncio
 import random
-import os
 from decimal import Decimal
-from typing import Dict, List, Optional, Set, ClassVar, Any
-
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Union, Any
 from pydantic import Field, validator
 
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig
 from hummingbot.client.config.config_data_types import ClientFieldData
-from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.connector.derivative.position import Position
-from hummingbot.core.data_type.common import OrderType, TradeType, PositionMode
-from hummingbot.core.data_type import common
-from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.strategy.strategy_base import StrategyBase
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
-from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
-from hummingbot.strategy_v2.controllers.directional_trading_controller_base import DirectionalTradingControllerConfigBase
+from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.logger import HummingbotLogger
+from hummingbot.connector.utils import split_hb_trading_pair
+from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
+from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.api_throttler.data_types import RateLimit
-from hummingbot.logger import HummingbotLogger
+from enum import Enum
 
 
-# Define the controller class
-class RebalancePerpetualController(ControllerBase):
-    """Controller for the rebalance perpetual strategy"""
-    
-    def __init__(self, config: ControllerConfigBase, market_data_provider, actions_queue):
-        super().__init__(config, market_data_provider, actions_queue)
-        self.config = config
-        
-    async def control_task(self):
-        """Main control loop"""
-        # This is a placeholder - the actual strategy logic is in the main class
-        await asyncio.sleep(1)
-        
-    async def stop(self):
-        """Stop the controller"""
-        self.logger().info("Stopping rebalance perpetual controller")
-        await super().stop()
-
-
-class RebalancePerpetualControllerConfig(DirectionalTradingControllerConfigBase):
-    """Configuration for the rebalance perpetual controller"""
-    controller_name: str = "rebalance_perpetual_controller"
-    controller_type: str = "rebalance_perpetual"
-    
-    # Trading parameters
-    threshold: float = Field(
-        default=0.05,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter threshold percentage for rebalancing (e.g., 0.05 for 5%): ",
-            prompt_on_new=True))
-    
-    target_value: float = Field(
-        default=200,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter target position value in quote currency: ",
-            prompt_on_new=True))
-    
-    is_buy: bool = Field(
-        default=True,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enable buy orders? (True/False): ",
-            prompt_on_new=True))
-    
-    # Additional parameters
-    sell_markup_pct: float = Field(
-        default=0.1,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter sell markup percentage (e.g., 0.1 for 0.1%): ",
-            prompt_on_new=True))
-    
-    buy_discount_pct: float = Field(
-        default=0.1,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter buy discount percentage (e.g., 0.1 for 0.1%): ",
-            prompt_on_new=True))
-    
-    def get_controller_class(self):
-        """Return the controller class for this config"""
-        return RebalancePerpetualController
+class PositionMode(str, Enum):
+    HEDGE = "Hedge"
+    ONEWAY = "OneWay"
 
 
 class RebalancePerpetualConfig(StrategyV2ConfigBase):
-    """Configuration parameters for the Rebalance Perpetual strategy"""
+    """Configuration for the Rebalance Perpetual strategy"""
+    script_file_name: str = Field(
+        default="rebalance_perpetual.py",
+        client_data=None,
+    )
     
-    script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
-    markets: Dict[str, Set[str]] = Field(default_factory=dict)
-    candles_config: List[CandlesConfig] = Field(default_factory=list)
-    controllers_config: List[ControllerConfigBase] = Field(default_factory=list)
-    
-    # Strategy-specific fields
+    # Exchange settings
     connector_name: str = Field(
-        default="binance_perpetual", 
+        default="bybit_perpetual",
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter the perpetual connector name (e.g., binance_perpetual): ",
-            prompt_on_new=True))
+            prompt="Enter the connector name (e.g. bybit_perpetual)",
+        )
+    )
     
+    # Trading pairs
+    trading_pairs: List[str] = Field(
+        default=["BTC-USDT", "ETH-USDT"],
+        client_data=ClientFieldData(
+            prompt="Enter the list of trading pairs (comma-separated)",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Position settings
     position_mode: str = Field(
-        default="HEDGE", 
+        default="Hedge",
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter position mode (HEDGE or ONEWAY): ",
-            prompt_on_new=True))
-    
+            prompt="Enter position mode (Hedge or OneWay)",
+            prompt_on_new=True,
+        )
+    )
     leverage: int = Field(
-        default=4, 
+        default=4,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter leverage to use for trading: ",
-            prompt_on_new=True))
-    
+            prompt="Enter leverage value",
+            prompt_on_new=True,
+        )
+    )
     max_leverage: int = Field(
         default=4,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter maximum leverage allowed: ",
-            prompt_on_new=True))
-    
+            prompt="Enter maximum leverage allowed",
+        )
+    )
     min_leverage: int = Field(
-        default=1,
+        default=2,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter minimum leverage allowed: ",
-            prompt_on_new=True))
+            prompt="Enter minimum leverage allowed",
+        )
+    )
     
-    trading_pairs: List[str] = Field(
-        default_factory=list,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter trading pairs separated by commas: ",
-            prompt_on_new=True))
-    
-    order_type: str = Field(
-        default="LIMIT",
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter order type (LIMIT or MARKET): ",
-            prompt_on_new=True))
-    
-    threshold: float = Field(
-        default=0.05,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter threshold percentage for rebalancing (e.g., 0.05 for 5%): ",
-            prompt_on_new=True))
-    
-    target_value: float = Field(
-        default=200,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter target position value in quote currency: ",
-            prompt_on_new=True))
-    
+    # Strategy parameters
     is_buy: bool = Field(
         default=True,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enable buy orders? (True/False): ",
-            prompt_on_new=True))
-    
-    sell_markup_pct: float = Field(
-        default=0.1,
+            prompt="Do you want to buy? (True/False)",
+            prompt_on_new=True,
+        )
+    )
+    threshold: float = Field(
+        default=0.05,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter sell markup percentage (e.g., 0.1 for 0.1%): ",
-            prompt_on_new=True))
-    
-    buy_discount_pct: float = Field(
-        default=0.1,
+            prompt="Enter threshold value (e.g. 0.05 for 5%)",
+            prompt_on_new=True,
+        )
+    )
+    target_value: float = Field(
+        default=200,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter buy discount percentage (e.g., 0.1 for 0.1%): ",
-            prompt_on_new=True))
-    
-    max_pairs_per_cycle: int = Field(
-        default=5,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter maximum pairs to process per cycle: ",
-            prompt_on_new=True))
-    
-    delay_between_orders_sec: float = Field(
-        default=0.5,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter delay between orders in seconds: ",
-            prompt_on_new=True))
-    
-    default_min_amount: float = Field(
-        default=0.001,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Enter default minimum order amount: ",
-            prompt_on_new=True))
-    
+            prompt="Enter target position value in USD",
+            prompt_on_new=True,
+        )
+    )
     buy_interval: int = Field(
         default=60,
         client_data=ClientFieldData(
-            prompt=lambda mi: "Enter interval between rebalance checks (seconds): ",
-            prompt_on_new=True))
-    
-    # Add validators as needed
-    @validator('trading_pairs', pre=True, allow_reuse=True)
-    def parse_trading_pairs(cls, v):
-        if isinstance(v, str):
-            return [pair.strip() for pair in v.split(',')]
-        return v
-    
-    def load_controller_configs(self) -> List[ControllerConfigBase]:
-        controller_config = RebalancePerpetualControllerConfig(
-            controller_name="rebalance_perpetual_controller",
-            controller_type="rebalance_perpetual",
-            connector_name=self.connector_name,
-            position_mode=self.position_mode,
-            leverage=self.leverage,
-            trading_pair=self.trading_pairs[0] if self.trading_pairs else "",
-            threshold=self.threshold,
-            target_value=self.target_value,
-            is_buy=self.is_buy,
-            sell_markup_pct=self.sell_markup_pct,
-            buy_discount_pct=self.buy_discount_pct
+            prompt="Enter checking interval in seconds",
+            prompt_on_new=True,
         )
-        return [controller_config]
+    )
+    order_type: str = Field(
+        default="LIMIT",
+        client_data=ClientFieldData(
+            prompt="Enter order type (LIMIT or MARKET)",
+        )
+    )
+    sell_markup_pct: float = Field(
+        default=0.1,
+        client_data=ClientFieldData(
+            prompt="Enter percentage markup for sell orders",
+        )
+    )
+    buy_discount_pct: float = Field(
+        default=0.1,
+        client_data=ClientFieldData(
+            prompt="Enter percentage discount for buy orders",
+        )
+    )
+    max_pairs_per_cycle: int = Field(
+        default=5,
+        client_data=ClientFieldData(
+            prompt="Enter maximum pairs to process per cycle",
+        )
+    )
+    delay_between_orders_sec: float = Field(
+        default=0.5,
+        client_data=ClientFieldData(
+            prompt="Enter delay between orders in seconds",
+        )
+    )
+    default_min_amount: float = Field(
+        default=0.001,
+        client_data=ClientFieldData(
+            prompt="Enter default minimum order amount",
+        )
+    )
+    
+    # Replace the rate_limits field with direct parameters
+    get_request_limit: int = Field(
+        default=20,
+        client_data=ClientFieldData(
+            prompt="Enter GET request rate limit per second",
+            prompt_on_new=False,
+        )
+    )
+    
+    post_request_limit: int = Field(
+        default=5,
+        client_data=ClientFieldData(
+            prompt="Enter POST request rate limit per second",
+            prompt_on_new=False,
+        )
+    )
+    
+    rate_limit_time_interval: float = Field(
+        default=1.0,
+        client_data=ClientFieldData(
+            prompt="Enter rate limit time interval in seconds",
+            prompt_on_new=False,
+        )
+    )
+    
+    # Min order amounts (will be moved to config)
+    min_order_amounts: Dict[str, float] = Field(
+        default={},
+        client_data=ClientFieldData(
+            prompt=None,  # This is too complex for direct prompting
+            prompt_on_new=False,
+        )
+    )
+    
+    # Override the inherited candles_config with an empty list
+    candles_config: List[CandlesConfig] = Field(
+        default_factory=list,  # Empty list by default
+        client_data=ClientFieldData(
+            prompt=None,
+            prompt_on_new=False,
+        )
+    )
+    
+    # Override the inherited markets field too
+    markets: Dict[str, Set[str]] = Field(
+        default_factory=dict,  # Empty dict by default
+        client_data=ClientFieldData(
+            prompt=None,
+            prompt_on_new=False,
+        )
+    )
+    
+    @validator("trading_pairs", pre=True, allow_reuse=True)
+    def validate_trading_pairs(cls, v):
+        """Validate and format trading pairs"""
+        if isinstance(v, str):
+            return [pair.strip() for pair in v.split(",")]
+        return v
 
 
 class RebalancePerpetual(StrategyV2Base):
@@ -243,51 +238,16 @@ class RebalancePerpetual(StrategyV2Base):
         if config is None:
             config = RebalancePerpetualConfig()
         
-        # Initialize with empty connectors if needed
-        if not connectors:
-            self.logger().warning("No connectors available. The strategy will prompt you to create one.")
-            # We'll continue initialization but will prompt for connector creation later
-            super().__init__(connectors, config)
-            self.config = config
-            self.connector_name = config.connector_name
-            self.ready_to_trade = False
-            return
-        
-        # Make sure the connector exists before trying to access it
-        if config.connector_name not in connectors:
-            available_connectors = list(connectors.keys())
-            self.logger().warning(f"Connector '{config.connector_name}' not found. Available connectors: {available_connectors}")
-            
-            # Prompt for connector selection if available
-            if available_connectors:
-                # Use the first available connector as default
-                config.connector_name = available_connectors[0]
-                self.logger().info(f"Using '{config.connector_name}' as fallback connector")
-            else:
-                self.logger().warning("No connectors available. Please run 'connect binance_perpetual' or another perpetual connector.")
-                super().__init__(connectors, config)
-                self.config = config
-                self.connector_name = config.connector_name
-                self.ready_to_trade = False
-                return
-        
+        # Call super().__init__ first
         super().__init__(connectors, config)
         self.config = config
         
-        # Initialize timestamp for interval checking
-        self.last_ordered_ts = 0
-        
-        # Store configuration
+        # --- Initialize essential attributes early ---
         self.connector_name = config.connector_name
-        self.connector = connectors[self.connector_name]
-        
-        # Position settings
-        self.position_mode = PositionMode[config.position_mode.upper()] if isinstance(config.position_mode, str) else config.position_mode
-        self.leverage = config.leverage
-        self.max_leverage = config.max_leverage
-        self.min_leverage = config.min_leverage
-        
-        # Strategy parameters
+        self.buy_interval = config.buy_interval
+        self.last_ordered_ts = 0
+        self.ready_to_trade = False  # Assume not ready initially
+        self.connector = None  # Initialize connector attribute
         self.rb = {
             "connector_name": self.connector_name,
             "trading_pair": config.trading_pairs,
@@ -296,111 +256,152 @@ class RebalancePerpetual(StrategyV2Base):
             "target_value": Decimal(str(config.target_value)),
             "status": "",
         }
-        
-        # Trading pairs
         self.trading_pair = self.rb["trading_pair"]
-        
-        # Check interval in seconds
-        self.buy_interval = config.buy_interval
-        
-        # Store the current price of the asset and the dict of order
         self.price = {}
         self.activate_order_id = {}
         self.asset_value = {}
-        
-        # Hedge fund variables
         self.set_leverage_flag = False
-        
-        # Minimal quantity
         self.min_amount = {}
+        # --- End of early initialization ---
         
-        # Create throttler
+        # Check if connectors dictionary is provided
+        if not connectors:
+            self.logger().warning("No connectors dictionary provided. Strategy cannot start.")
+            # self.ready_to_trade remains False
+            return  # Exit initialization
+        
+        # Check if the configured connector exists in the provided dictionary
+        if self.connector_name not in connectors:
+            available_connectors = list(connectors.keys())
+            self.logger().warning(f"Connector '{self.connector_name}' not found. Available connectors: {available_connectors}")
+            # Attempt to use the first available connector as a fallback (consider if this is desired behavior)
+            if available_connectors:
+                self.connector_name = available_connectors[0]
+                self.config.connector_name = self.connector_name  # Update config object as well
+                self.rb["connector_name"] = self.connector_name  # Update rb dictionary
+                self.logger().info(f"Using '{self.connector_name}' as fallback connector.")
+                self.connector = connectors[self.connector_name]
+            else:
+                self.logger().error("No available connectors to use. Strategy cannot start.")
+                # self.ready_to_trade remains False
+                return  # Exit initialization
+        else:
+            # Assign the connector if it exists
+            self.connector = connectors[self.connector_name]
+        
+        # Check connector readiness
+        if not self.connector or not self.connector.ready:
+            self.logger().warning(f"Connector {self.connector_name} is not ready. Please wait or run 'connect {self.connector_name}'.")
+            # self.ready_to_trade remains False
+            # Don't return here, allow on_tick to handle the not ready state
+        else:
+            self.ready_to_trade = True  # Set to True only if connector exists and is ready
+        
+        # Set up the position mode and leverage (only for perpetual connectors)
+        if hasattr(self.connector, "set_leverage"):
+            self.logger().info(f"Setting leverage to {config.leverage}")
+            for tp in self.trading_pair:
+                try:
+                    self.connector.set_leverage(trading_pair=tp, leverage=config.leverage)
+                except Exception as e:
+                    self.logger().error(f"Error setting leverage for {tp}: {str(e)}")
+        
+        if hasattr(self.connector, "set_position_mode"):
+            try:
+                pos_mode = PositionMode[config.position_mode.upper()]
+                self.logger().info(f"Setting position mode to {pos_mode.value}")
+                self.connector.set_position_mode(pos_mode)
+            except Exception as e:
+                self.logger().error(f"Error setting position mode: {str(e)}")
+        
+        # Load minimum order amounts from config or use defaults
+        self.initialize_min_amounts()
+        
+        # Initialize min notional value (can be retrieved from exchange info or set as a fallback)
+        self.min_notional = Decimal("10.0")  # Default minimum notional value in USDT
+        
+        # Initialize the throttler using configs
         self.create_throttler()
         
-        # Validate trading pairs and set leverage
+        # Validate that the trading pairs exist on the exchange
         self.validate_trading_pairs()
-        self.check_and_set_leverage()
         
-        # Initialize the strategy
-        self.initialize_strategy()
-
+        # Log initialization completed
+        self.logger().info("Starting Rebalance Perpetual strategy...")
+    
+    def initialize_strategy(self):
+        """Additional initialization after connector is ready"""
+        # This method will be called after the connector is ready
+        # Additional setup can be done here
+        pass
+    
+    def initialize_min_amounts(self):
+        """Initialize minimum order amounts for each trading pair"""
+        # Use values from config if present, otherwise use a small default value
+        for tp in self.trading_pair:
+            if tp in self.config.min_order_amounts:
+                self.min_amount[tp] = Decimal(str(self.config.min_order_amounts[tp]))
+            else:
+                self.min_amount[tp] = Decimal(str(self.config.default_min_amount))
+    
     def create_throttler(self):
-        """Create a throttler with exchange's specific rate limits"""
+        """Create a throttler using configured rate limits"""
         try:
-            rate_limits = []
-            rate_limits.append(RateLimit(limit_id="GET", limit=10, time_interval=1))
-            rate_limits.append(RateLimit(limit_id="POST", limit=10, time_interval=1))
-            self.throttler = AsyncThrottler(rate_limits=rate_limits)
+            # Create rate limits directly from config fields
+            configured_rate_limits = [
+                RateLimit(limit_id="GET", limit=self.config.get_request_limit, time_interval=self.config.rate_limit_time_interval),
+                RateLimit(limit_id="POST", limit=self.config.post_request_limit, time_interval=self.config.rate_limit_time_interval)
+            ]
+
+            self.throttler = AsyncThrottler(rate_limits=configured_rate_limits)
+            self.logger().info(f"Throttler created with limits: {[str(rl) for rl in configured_rate_limits]}")
         except Exception as e:
             self.logger().error(f"Error creating throttler: {str(e)}")
-
-    def initialize_strategy(self):
-        """Initialize the strategy"""
-        self.logger().info("Initializing Rebalance Perpetual strategy...")
-        self.logger().info(f"Connector: {self.connector_name}")
-        self.logger().info(f"Position Mode: {self.position_mode}")
-        self.logger().info(f"Leverage: {self.leverage}")
-        self.logger().info(f"Trading Pairs: {self.trading_pair}")
-        self.logger().info(f"Threshold: {self.rb['threshold']}")
-        self.logger().info(f"Target Value: {self.rb['target_value']}")
-        self.logger().info(f"Is Buy: {self.rb['is_buy']}")
-        
-        # Initialize minimum amounts for each trading pair
-        for tp in self.trading_pair:
-            self.min_amount[tp] = Decimal(str(self.config.default_min_amount))
-        
-        self.logger().info("Strategy initialization complete")
-
+            self.throttler = None  # Ensure throttler is None on error to prevent later issues
+    
     def validate_trading_pairs(self):
-        """Validate trading pairs and set minimum amounts"""
+        """Validate trading pairs before any other operations"""
+        perp_connector = self.connector
         valid_trading_pairs = []
         
-        for tp in self.trading_pair:
-            try:
-                # Check if the trading pair exists on the exchange
-                self.connector.get_mid_price(tp)
-                valid_trading_pairs.append(tp)
-            except Exception as e:
-                self.logger().warning(f"Trading pair {tp} is not valid: {str(e)}")
+        # Get all available trading pairs from the exchange
+        all_exchange_trading_pairs = perp_connector._trading_pairs
+        self.logger().info(f"Available trading pairs on {self.connector_name}: {all_exchange_trading_pairs}")
         
-        # Update trading pairs with only valid ones
+        # Filter our trading pairs list to only include valid ones
+        for trading_pair in self.trading_pair:
+            try:
+                # Try to get the exchange symbol - this will fail if the pair doesn't exist
+                exchange_symbol = perp_connector.exchange_symbol_associated_to_pair(trading_pair)
+                valid_trading_pairs.append(trading_pair)
+                self.logger().info(f"Validated trading pair: {trading_pair}")
+            except Exception as e:
+                self.logger().warning(f"Trading pair {trading_pair} not available on {self.connector_name}: {str(e)}. Skipping.")
+        
+        # Update trading_pair list with only valid pairs
         self.trading_pair = valid_trading_pairs
         self.rb["trading_pair"] = valid_trading_pairs
         
-        self.logger().info(f"Using {len(valid_trading_pairs)} valid trading pairs: {valid_trading_pairs}")
-
-    def check_and_set_leverage(self):
-        if not self.set_leverage_flag:
-            perp_connector = self.connector
-            try:
-                perp_connector.set_position_mode(self.position_mode)
-                
-                # Set leverage for each validated trading pair
-                for trading_pair in self.trading_pair:
-                    try:
-                        perp_connector.set_leverage(
-                            trading_pair=trading_pair, leverage=self.leverage
-                        )
-                        self.logger().info(f"Set leverage to {self.leverage} for {trading_pair}")
-                    except Exception as e:
-                        self.logger().warning(f"Error setting leverage for {trading_pair}: {str(e)}")
-                
-                self.logger().info(
-                    f"Leverage setting completed for {len(self.trading_pair)} trading pairs"
-                )
-            except Exception as e:
-                self.logger().error(f"Error setting position mode: {str(e)}")
-            
-            self.set_leverage_flag = True
+        # Also update min_amount dictionary to only include valid pairs
+        valid_min_amounts = {}
+        for tp in valid_trading_pairs:
+            if tp in self.min_amount:
+                valid_min_amounts[tp] = self.min_amount[tp]
+        self.min_amount = valid_min_amounts
     
     def on_tick(self):
         """
-        Main strategy logic, execute at an interval
+        The main logic for the strategy, executed at every tick.
+        Checks if it's time to execute a rebalance operation.
         """
-        # Check if connectors are available
+        # First check if ready to trade
         if not self.ready_to_trade:
-            self.logger().warning("Strategy not ready to trade. Please run 'connect binance_perpetual' or another perpetual connector.")
-            return
+            if self.connector and self.connector.ready:
+                self.ready_to_trade = True
+                self.initialize_strategy()  # Initialize strategy now that connector is ready
+            else:
+                # Not ready to trade, log warning and exit
+                return
         
         # Check if it reaches the next checkpoint interval
         if self.last_ordered_ts < (self.current_timestamp - self.buy_interval):
@@ -414,19 +415,19 @@ class RebalancePerpetual(StrategyV2Base):
                     safe_ensure_future(self.rate_limited_operations())
                 except Exception as e:
                     self.logger().error(f"Error in on_tick: {str(e)}")
-            self.last_ordered_ts = self.current_timestamp               
+            self.last_ordered_ts = self.current_timestamp                
     
-    # Cancel all order
     def cancel_all_order(self):
+        """Cancel all active orders"""
         for exchange in self.connectors.values():
             safe_ensure_future(exchange.cancel_all(timeout_seconds=6))
-
-    # Initialization
+    
     def init_rebalance(self):
-        self.logger().info("Starting Rebalance Perpetual strategy...")
+        """Initialize the rebalance strategy"""
+        self.logger().info("Starting Initialization.....")
         self.rb["status"] = "ACTIVATE"
         self.market = self.rb["connector_name"]
-
+    
     def get_balance(self):
         """
         Get the current balance status:
@@ -463,13 +464,13 @@ class RebalancePerpetual(StrategyV2Base):
             self.asset_value[tp] = amount * price
             total_asset_value = self.asset_value[tp]
             total_unrealized_pnl = unrealized_pnl + total_unrealized_pnl
-
+    
     def create_order(self):
         """
-        Create order based on the difference between base asset value and target value
+        Create orders based on the difference between base asset value and target value
         1. If position value more than target value +threshold, sell 
         2. If position value less than target value -threshold, buy
-        3. If within the threshold, then create both buy and sell orders
+        3. If within the threshold, create either buy or sell order randomly
         """
         rb = self.rb.copy()
         # Process only a limited number of trading pairs at a time to avoid rate limits
@@ -487,21 +488,21 @@ class RebalancePerpetual(StrategyV2Base):
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
                     OrderType.LIMIT,
-                    self.price[tp] * (1 + Decimal(str(self.config.sell_markup_pct)) / Decimal("100")),
-                    common.PositionAction.CLOSE
+                    self.price[tp] * Decimal("1.001"),
+                    PositionAction.CLOSE
                 )
                 processed_pairs += 1
                 time.sleep(self.config.delay_between_orders_sec)  # Add delay between orders
             
             elif self.asset_value[tp] < rb["target_value"] * (1 - rb["threshold"]):
-                # Open order: when position value is low
+                # Buy order: when position value is low
                 self.buy(
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
                     OrderType.LIMIT,
-                    self.price[tp] * (1 - Decimal(str(self.config.buy_discount_pct)) / Decimal("100")),
-                    common.PositionAction.OPEN
+                    self.price[tp] * Decimal("0.9999"),
+                    PositionAction.OPEN
                 )
                 processed_pairs += 1
                 time.sleep(self.config.delay_between_orders_sec)  # Add delay between orders
@@ -514,8 +515,8 @@ class RebalancePerpetual(StrategyV2Base):
                         tp,
                         max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
                         OrderType.LIMIT,
-                        self.price[tp] * (1 + Decimal(str(self.config.sell_markup_pct)) / Decimal("100")),
-                        common.PositionAction.CLOSE
+                        self.price[tp] * Decimal(1 + self.config.sell_markup_pct/100),
+                        PositionAction.CLOSE
                     )
                 else:
                     self.buy(
@@ -523,26 +524,19 @@ class RebalancePerpetual(StrategyV2Base):
                         tp,
                         max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
                         OrderType.LIMIT,
-                        self.price[tp] * (1 - Decimal(str(self.config.buy_discount_pct)) / Decimal("100")),
-                        common.PositionAction.OPEN
+                        self.price[tp] * Decimal(1 - self.config.buy_discount_pct/100),
+                        PositionAction.OPEN
                     )
                 processed_pairs += 1
                 time.sleep(self.config.delay_between_orders_sec)  # Add delay between orders
-                
-    # Format output
+    
     def format_status(self) -> str:
         """
-        Returns status of the current strategy on user balances and current active orders. 
+        Returns status of the current strategy on user balances and current active orders.
         This function is called when status command is issued.
         """                
         if not self.ready_to_trade:
-            return """
-    Market connectors are not ready.
-
-    Please follow these steps:
-    1. Run 'connect binance_perpetual' (or another perpetual connector)
-    2. Restart the strategy with 'start --script rebalance_perpetual.py'
-    """
+            return "Market connectors are not ready"
         lines = []
         try:
             warning_lines = []
@@ -557,20 +551,14 @@ class RebalancePerpetual(StrategyV2Base):
         if len(warning_lines) > 0:
             lines.extend(["", "*** WARNINGS ***"] + warning_lines)
         return '\n'.join(lines)
-
-    # Retrieve the position stats
+    
     def get_positions_df(self) -> pd.DataFrame:
         """
         Returns a data frame for all asset positions for displaying purpose.
         """          
-        columns: List[str] = ["Exchange", 
-                              "Trading Pair", 
-                              "Amount", 
-                              "Entry Price", "Current Price",
-                              "Unrealized pnl", 
-                              "Percentage" 
-                            ]
-        data: List[Any] = []
+        columns = ["Exchange", "Trading Pair", "Amount", "Entry Price", "Current Price", 
+                  "Unrealized PnL", "Percentage"]
+        data = []
         dc_position = self.connectors[self.connector_name].account_positions
         for trading_pair in dc_position:
             amount = Decimal(dc_position[trading_pair].amount)
@@ -590,7 +578,7 @@ class RebalancePerpetual(StrategyV2Base):
         df = pd.DataFrame(data=data, columns=columns)
         df.sort_values(by=["Exchange", "Trading Pair"], inplace=True)    
         return df
-
+    
     async def rate_limited_operations(self):
         """Run operations with rate limiting to avoid API limits"""
         try:
@@ -613,3 +601,7 @@ class RebalancePerpetual(StrategyV2Base):
                 self.create_order()
         except Exception as e:
             self.logger().error(f"Error in rate_limited_operations: {str(e)}")
+
+    def get_strategy_config_class() -> type:
+        """Return the config class for strategy"""
+        return RebalancePerpetualConfig
