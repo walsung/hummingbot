@@ -468,14 +468,14 @@ class RebalancePerpetual(StrategyV2Base):
     def create_order(self):
         """
         Create orders based on the difference between base asset value and target value
-        1. If position value more than target value +threshold, sell 
-        2. If position value less than target value -threshold, buy
-        3. If within the threshold, create either buy or sell order randomly
         """
         rb = self.rb.copy()
         # Process only a limited number of trading pairs at a time to avoid rate limits
         processed_pairs = 0
         max_pairs_per_cycle = self.config.max_pairs_per_cycle
+        
+        # Convert string order type from config to OrderType enum
+        order_type = OrderType.LIMIT if self.config.order_type.upper() == "LIMIT" else OrderType.MARKET
         
         for tp in self.asset_value:
             if processed_pairs >= max_pairs_per_cycle:
@@ -487,12 +487,12 @@ class RebalancePerpetual(StrategyV2Base):
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT,
+                    order_type,  # Use the config value
                     self.price[tp] * Decimal("1.001"),
                     PositionAction.CLOSE
                 )
                 processed_pairs += 1
-                time.sleep(self.config.delay_between_orders_sec)  # Add delay between orders
+                time.sleep(self.config.delay_between_orders_sec)
             
             elif self.asset_value[tp] < rb["target_value"] * (1 - rb["threshold"]):
                 # Buy order: when position value is low
@@ -500,12 +500,12 @@ class RebalancePerpetual(StrategyV2Base):
                     self.rb["connector_name"], 
                     tp,
                     max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                    OrderType.LIMIT,
+                    order_type,  # Use the config value
                     self.price[tp] * Decimal("0.9999"),
                     PositionAction.OPEN
                 )
                 processed_pairs += 1
-                time.sleep(self.config.delay_between_orders_sec)  # Add delay between orders
+                time.sleep(self.config.delay_between_orders_sec)
             
             else:
                 # Only place one order (not both) to reduce API calls
@@ -514,7 +514,7 @@ class RebalancePerpetual(StrategyV2Base):
                         self.rb["connector_name"], 
                         tp,
                         max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                        OrderType.LIMIT,
+                        order_type,  # Use the config value
                         self.price[tp] * Decimal(1 + self.config.sell_markup_pct/100),
                         PositionAction.CLOSE
                     )
@@ -523,12 +523,12 @@ class RebalancePerpetual(StrategyV2Base):
                         self.rb["connector_name"], 
                         tp,
                         max(Decimal(rb["target_value"] * rb["threshold"]) / self.price[tp], self.min_amount[tp]),
-                        OrderType.LIMIT,
+                        order_type,  # Use the config value
                         self.price[tp] * Decimal(1 - self.config.buy_discount_pct/100),
                         PositionAction.OPEN
                     )
                 processed_pairs += 1
-                time.sleep(self.config.delay_between_orders_sec)  # Add delay between orders
+                time.sleep(self.config.delay_between_orders_sec)
     
     def format_status(self) -> str:
         """

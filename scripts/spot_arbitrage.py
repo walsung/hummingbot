@@ -1,628 +1,418 @@
 """
-Spot Arbitrage Strategy
+Spot Arbitrage Strategy V2
 
 This strategy monitors price differences between the same trading pair on two exchanges
-(Binance and Bybit) and executes arbitrage trades when profitable opportunities arise.
+and executes arbitrage trades when profitable opportunities arise.
 """
 
 import logging
-import pandas as pd
-import numpy as np
 import time
 import asyncio
 import random
 from datetime import datetime
+from decimal import Decimal
+from typing import ClassVar, Dict, List, Optional, Set, Union, Any
+from pydantic import Field, validator
 
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig
+from hummingbot.client.config.config_data_types import ClientFieldData
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.logger import HummingbotLogger
 from hummingbot.connector.utils import split_hb_trading_pair
-from hummingbot.core.event.events import (
-  BuyOrderCompletedEvent,
-  BuyOrderCreatedEvent,
-  MarketOrderFailureEvent,
-  OrderCancelledEvent,
-  OrderFilledEvent,
-  SellOrderCompletedEvent,
-  SellOrderCreatedEvent,
-)
-from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
-from typing import Dict, Any, List, Set
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import OrderType, TradeType
-from hummingbot.core.data_type import common
+from hummingbot.core.event.events import OrderFilledEvent, BuyOrderCompletedEvent, SellOrderCompletedEvent
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.connector.exchange_base import ExchangeBase
-from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
-from hummingbot.core.api_throttler.data_types import RateLimit
 
-class SpotArbitrage(ScriptStrategyBase):
+
+class SpotArbitrageConfig(StrategyV2ConfigBase):
+    """Configuration for the Spot Arbitrage strategy"""
+    
+    # Override the inherited fields with empty defaults
+    candles_config: List[CandlesConfig] = Field(
+        default_factory=list,
+        client_data=ClientFieldData(
+            prompt=None,
+            prompt_on_new=False,
+        )
+    )
+    
+    markets: Dict[str, Set[str]] = Field(
+        default_factory=dict,
+        client_data=ClientFieldData(
+            prompt=None,
+            prompt_on_new=False,
+        )
+    )
+    
+    # First exchange configuration
+    exchange_1: str = Field(
+        default="binance",
+        client_data=ClientFieldData(
+            prompt="Enter the first exchange name",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Second exchange configuration
+    exchange_2: str = Field(
+        default="bybit",
+        client_data=ClientFieldData(
+            prompt="Enter the second exchange name",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Trading pairs
+    trading_pairs: List[str] = Field(
+        default=["ETH-USDT", "BTC-USDT"],
+        client_data=ClientFieldData(
+            prompt="Enter trading pairs (comma-separated)",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Minimum profitability threshold
+    min_profitability: float = Field(
+        default=0.5,
+        client_data=ClientFieldData(
+            prompt="Enter minimum profitability threshold (%)",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Order amount in USD
+    order_amount_usd: float = Field(
+        default=5.0,
+        client_data=ClientFieldData(
+            prompt="Enter order amount in USD",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Maximum order age in seconds
+    max_order_age: int = Field(
+        default=60,
+        client_data=ClientFieldData(
+            prompt="Enter maximum order age in seconds",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Check interval in seconds
+    check_interval: int = Field(
+        default=5,
+        client_data=ClientFieldData(
+            prompt="Enter check interval in seconds",
+            prompt_on_new=True,
+        )
+    )
+    
+    # Minimum order amounts for trading pairs
+    min_order_amounts: Dict[str, float] = Field(
+        default={},
+        client_data=ClientFieldData(
+            prompt=None,  # Too complex for direct prompting
+            prompt_on_new=False,
+        )
+    )
+    
+    @validator("trading_pairs", pre=True, allow_reuse=True)
+    def validate_trading_pairs(cls, v):
+        """Validate and format trading pairs"""
+        if isinstance(v, str):
+            return [pair.strip() for pair in v.split(",")]
+        return v
+
+
+class SpotArbitrage(StrategyV2Base):
     """
     This strategy monitors price differences between the same trading pair on two exchanges
     and executes arbitrage trades when profitable opportunities arise.
     """
-    # Define common trading pairs for both exchanges
-    # 2025-03-30 -- Binance and Bybit Newer pairs (not in Convert list, inferred from Spot Trading Rules)
-    common_trading_pairs = [
-        "BERA-USDT",
-        "DOGE-USDT",
-        "GALA-USDT",
-        "MEME-USDT",
-        "OP-USDT",
-        "INJ-USDT",
-        "ADA-USDT",
-        "ORDI-USDT",
-        "NEAR-USDT",
-        "SEI-USDT",
-        "ICP-USDT",
-        "WLD-USDT",
-        "BNB-USDT",
-        "AVAX-USDT",
-        "ETH-USDT",
-        "ALGO-USDT",
-        "TIA-USDT",
-        "BTC-USDT",
-        "SOL-USDT",
-        "TON-USDT",
-        "SUN-USDT",
-        # "ALPACA-USDT",
-        # "RARE-USDT",
-        # "REZ-USDT",
-        "TRX-USDT",
-        "XRP-USDT",
-        "UNI-USDT",
-        "PNUT-USDT",
-        "SUI-USDT",
-        "ENA-USDT",
-        "JUP-USDT",
-        "WIF-USDT",
-        # "BANANAS31-USDT",
-        # "WAL-USDT",
-        # "BNB-USDC",
-        # "BCH-USDC",
-        # "NEAR-USDC",
-        # "WIF-USDC",
-        # "BONK-USDC",
-        # "SOL-USDC",
-        # "XRP-USDC",
-        # "ADA-USDC",
-        # "AVAX-USDC",
-        # "TON-USDC"
-        'BNB-USDC', 
-        'BTC-USDC', 
-        'ETH-USDC', 
-        'XRP-USDC', 
-        'EOS-USDC', 
-        'XLM-USDC', 
-        'LINK-USDC', 
-        'LTC-USDC',
-        'TRX-USDC', 
-        'ADA-USDC', 
-        # 'NEO-USDC', 
-        'ATOM-USDC', 
-        # 'ALGO-USDC', 
-        'DOGE-USDC', 
-        # 'ONT-USDC', 
-        'BCH-USDC',
-        'SOL-USDC', 
-        'ARB-USDC', 
-        'AVAX-USDC', 
-        'DOT-USDC', 
-        'INJ-USDC', 
-        'OP-USDC', 
-        # 'ORDI-USDC', 
-        'SUI-USDC',
-        'TIA-USDC', 
-        # 'MANTA-USDC', 
-        # 'BLUR-USDC', 
-        # 'ALT-USDC', 
-        'SEI-USDC', 
-        # 'JUP-USDC', 
-        'FIL-USDC', 
-        'WLD-USDC',
-        'UNI-USDC', 
-        # 'PIXEL-USDC', 
-        'STRK-USDC', 
-        'PEPE-USDC', 
-        'SHIB-USDC', 
-        'NEAR-USDC', 
-        'FET-USDC',
-        # 'EUR-USDC', 
-        'BONK-USDC', 
-        'FLOKI-USDC', 
-        # 'PENDLE-USDC', 
-        # 'BOME-USDC', 
-        # 'JTO-USDC', 
-        'WIF-USDC',
-        # 'CKB-USDC', 
-        # 'ENA-USDC', 
-        # 'ETHFI-USDC', 
-        # 'YGG-USDC', 
-        # 'CFX-USDC', 
-        # 'RUNE-USDC', 
-        # 'SAGA-USDC',
-        'APT-USDC', 
-        # 'GALA-USDC', 
-        # 'STX-USDC', 
-        'ICP-USDC', 
-        # 'OMNI-USDC', 
-        # 'TRB-USDC',
-        # 'ARKM-USDC', 
-        # "EURI-USDC", 
-        # "SYN-USDC", 
-        # "VELODROME-USDC", 
-        # "HBAR-USDC", 
-        # "POL-USDC", 
-        # "SUSHI-USDC",
-        # "CVC-USDC"  # kraken and binance pair
-        
-    ]
+    _logger = None
+    markets: ClassVar[Dict[str, Set[str]]] = {}
     
-    # Define exchanges and trading pairs
-    exchange_configs = {
-        "binance": {
-            "min_profitability": Decimal("0.005"),  # 0.5% minimum profitability
-            "order_amount_usd": Decimal("5"),      # Order size in USD
-            "max_order_age": 60,                    # Max order age in seconds
-        },
-        "bybit": {
-            "min_profitability": Decimal("0.005"),  # 0.5% minimum profitability
-            "order_amount_usd": Decimal("5"),      # Order size in USD
-            "max_order_age": 60,                    # Max order age in seconds
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
+    
+    @classmethod
+    def init_markets(cls, config: SpotArbitrageConfig):
+        """Initialize the markets for the strategy"""
+        cls.markets = {
+            config.exchange_1: set(config.trading_pairs),
+            config.exchange_2: set(config.trading_pairs)
         }
-    }
+        return cls.markets
     
-    # Arbitrage threshold (percentage)
-    THRESHOLD = Decimal("0.5")  # value 1 = 1% price difference threshold,  0.1 = 0.1% price difference threshold
-    
-    # Define markets as a class attribute
-    markets = {}
-    for exchange in exchange_configs:
-        markets[exchange] = common_trading_pairs
-    
-    # Common variables
-    last_checked_ts = 0
-    check_interval = 5  # check interval in seconds
-    
-    # Store data for each exchange
-    prices = {}
-    active_orders = {}
-    arbitrage_opportunities = {}
-    
-    # Minimum order sizes for various trading pairs
-    
-    min_amount = {
-      "BERA-USDT": Decimal("10"),
-      "DOGE-USDT": Decimal("12"),
-      "LDOM-USDT": Decimal("10"),
-      "GALA-USDT": Decimal("10"),
-      "1000PEPE-USDT": Decimal("309"),
-      "MEME-USDT": Decimal("1"),
-      "OP-USDT": Decimal("1.3"),
-      "INJ-USDT": Decimal("0.3"),
-      "ADA-USDT": Decimal("10"),
-      "ORDI-USDT": Decimal("0.1"),
-      "MATIC-USDT": Decimal("10"),
-      "NEAR-USDT": Decimal("1"),
-      "SEI-USDT": Decimal("10"),
-      "ICP-USDT": Decimal("0.1"),
-      "WLD-USDT": Decimal("3"),
-      "BSV-USDT": Decimal("0.01"),
-      "BNB-USDT": Decimal("0.01"),
-      "AVAX-USDT": Decimal("1"),
-      "ETH-USDT": Decimal("0.01"),
-      "ALGO-USDT": Decimal("10"),
-      "TIA-USDT": Decimal("1"),
-      "BTC-USDT": Decimal("0.0001"),
-      "SOL-USDT": Decimal("1"),
-      "TON-USDT": Decimal("1"),
-      "SUN-USDT": Decimal("130"),
-      "BOND-USDT": Decimal("2.6"),
-      "ALPACA-USDT": Decimal("23"),
-      "REEF-USDT": Decimal("5189"),
-      "RARE-USDT": Decimal("21"),
-      "REZ-USDT": Decimal("97"),
-      "DDGS-USDT": Decimal("3976"),
-      "TRX-USDT": Decimal("32"),
-      "XRP-USDT": Decimal("9.4"),
-      "UNI-USDT": Decimal("1"),
-      "PNUT-USDT": Decimal("4"),
-      "SUI-USDT": Decimal("1.4"),
-      "MNT-USDT": Decimal("741"),
-      "ENA-USDT": Decimal("1.1"),
-      "JUP-USDT": Decimal("0.8"),
-      "WIF-USDT": Decimal("5"),
-      "BONK-USDT": Decimal("24331"),
-      "FLOKI-USDT": Decimal("4367"),
-      "SHIB-USDT": Decimal("24330"),
-      "AMI-USDT": Decimal("10"),      # AMI: Min Transaction Limit = 10
-    # 2025 March -- Newer pairs (not in Convert list, inferred from Spot Trading Rules)
-      "VVV-USDT": Decimal("1"),       # Default to 1 USDT notional value (Source 5)
-      "BANANAS31-USDT": Decimal("1"), # Unlisted; use 1 USDT equivalent
-      "KILO-USDT": Decimal("1"),      # Unlisted; use 1 USDT equivalent
-      "WAL-USDT": Decimal("1"),       # Unlisted; use 1 USDT equivalent
-      "B3TR-USDT": Decimal("7"),       # From Convert list (B3TR: Min = 7)
-            # USDC pairs
-      'BNB-USDC': Decimal("0.01"),      # Min order size: 0.01 BNB
-      'BTC-USDC': Decimal("0.0001"),    # Min order size: 0.0001 BTC
-      'ETH-USDC': Decimal("0.001"),     # Min order size: 0.001 ETH
-      'XRP-USDC': Decimal("10"),        # Min order size: 10 XRP
-      'EOS-USDC': Decimal("1"),         # Min order size: 1 EOS
-      'XLM-USDC': Decimal("10"),        # Min order size: 10 XLM
-      'LINK-USDC': Decimal("0.1"),      # Min order size: 0.1 LINK
-      'LTC-USDC': Decimal("0.01"),      # Min order size: 0.01 LTC
-      'TRX-USDC': Decimal("100"),       # Min order size: 100 TRX
-      'ADA-USDC': Decimal("10"),        # Min order size: 10 ADA
-      'NEO-USDC': Decimal("0.1"),       # Min order size: 0.1 NEO
-      'ATOM-USDC': Decimal("0.1"),      # Min order size: 0.1 ATOM
-      'ALGO-USDC': Decimal("10"),       # Min order size: 10 ALGO
-      'DOGE-USDC': Decimal("100"),      # Min order size: 100 DOGE
-      'ONT-USDC': Decimal("10"),        # Min order size: 10 ONT
-      'BCH-USDC': Decimal("0.01"),      # Min order size: 0.01 BCH
-      'SOL-USDC': Decimal("0.1"),       # Min order size: 0.1 SOL
-      'ARB-USDC': Decimal("1"),         # Min order size: 1 ARB
-      'AVAX-USDC': Decimal("0.1"),      # Min order size: 0.1 AVAX
-      'DOT-USDC': Decimal("0.1"),       # Min order size: 0.1 DOT
-      'INJ-USDC': Decimal("0.1"),       # Min order size: 0.1 INJ
-      'OP-USDC': Decimal("1"),          # Min order size: 1 OP
-      'ORDI-USDC': Decimal("0.01"),     # Min order size: 0.01 ORDI
-      'SUI-USDC': Decimal("1"),         # Min order size: 1 SUI
-      'TIA-USDC': Decimal("0.1"),       # Min order size: 0.1 TIA
-      'MANTA-USDC': Decimal("1"),       # Min order size: 1 MANTA
-      'BLUR-USDC': Decimal("10"),       # Min order size: 10 BLUR
-      'ALT-USDC': Decimal("10"),        # Min order size: 10 ALT
-      'SEI-USDC': Decimal("10"),        # Min order size: 10 SEI
-      'JUP-USDC': Decimal("10"),        # Min order size: 10 JUP
-      'FIL-USDC': Decimal("0.1"),       # Min order size: 0.1 FIL
-      'WLD-USDC': Decimal("1"),         # Min order size: 1 WLD
-      'UNI-USDC': Decimal("0.1"),       # Min order size: 0.1 UNI
-      'PIXEL-USDC': Decimal("10"),      # Min order size: 10 PIXEL
-      'STRK-USDC': Decimal("1"),        # Min order size: 1 STRK
-      'PEPE-USDC': Decimal("50000"),    # Min order size: ~$10 at current prices (varies)
-      'SHIB-USDC': Decimal("100000"),   # Min order size: ~$10 at current prices
-      'NEAR-USDC': Decimal("1"),        # Min order size: 1 NEAR
-      'FET-USDC': Decimal("10"),        # Min order size: 10 FET
-      'EUR-USDC': Decimal("10"),        # Min order size: 10 EUR (stablecoin)
-      'BONK-USDC': Decimal("100000"),   # Min order size: ~$10 at current prices
-      'FLOKI-USDC': Decimal("10000"),   # Min order size: ~$10 at current prices
-      'PENDLE-USDC': Decimal("1"),      # Min order size: 1 PENDLE
-      'BOME-USDC': Decimal("10000"),    # Min order size: ~$10 at current prices
-      'JTO-USDC': Decimal("1"),         # Min order size: 1 JTO
-      'WIF-USDC': Decimal("10"),        # Min order size: 10 WIF
-      'CKB-USDC': Decimal("1000"),      # Min order size: 1000 CKB
-      'ENA-USDC': Decimal("10"),        # Min order size: 10 ENA
-      'ETHFI-USDC': Decimal("1"),       # Min order size: 1 ETHFI
-      'YGG-USDC': Decimal("10"),        # Min order size: 10 YGG
-      'CFX-USDC': Decimal("10"),        # Min order size: 10 CFX
-      'RUNE-USDC': Decimal("1"),        # Min order size: 1 RUNE
-      'SAGA-USDC': Decimal("1"),        # Min order size: 1 SAGA
-      'APT-USDC': Decimal("0.1"),       # Min order size: 0.1 APT
-      'GALA-USDC': Decimal("100"),      # Min order size: 100 GALA
-      'STX-USDC': Decimal("1"),         # Min order size: 1 STX
-      'ICP-USDC': Decimal("0.1"),       # Min order size: 0.1 ICP
-      'OMNI-USDC': Decimal("1"),        # Min order size: 1 OMNI
-      'TRB-USDC': Decimal("0.1"),       # Min order size: 0.1 TRB
-      'ARKM-USDC': Decimal("1"),        # Min order size: 1 ARKM
-      "EURI-USDC": Decimal("10"),       # Min order size: 10 EURI
-      "SYN-USDC": Decimal("10"),        # Min order size: 10 SYN
-      "VELODROME-USDC": Decimal("10"),   # Min order size: 10 VELO
-      "HBAR-USDC": Decimal("10"),        # Min order size: 10 HBAR
-      "POL-USDC": Decimal("1"),          # Min order size: 1 POL
-      "SUSHI-USDC": Decimal("1"),        # Min order size: 1 SUSHI
-      "CVC-USDC": Decimal("100")        # Min order size: 100 CVC
-    }
-    
-    def __init__(self, connectors: Dict[str, ConnectorBase]):
-        super().__init__(connectors)
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: Optional[SpotArbitrageConfig] = None):
+        if config is None:
+            config = SpotArbitrageConfig()
         
-        # Initialize exchange-specific configurations
-        self.exchange_data = {}
-        self.instance_markets = {}
+        # Call super().__init__ first
+        super().__init__(connectors, config)
+        self.config = config
         
-        # Setup each exchange
-        for exchange_name in self.exchange_configs:
-            if exchange_name in connectors:
-                # Initialize exchange data
-                self.exchange_data[exchange_name] = {
-                    "status": "ACTIVE",
-                    "trading_pairs": [],
-                    "min_profitability": self.exchange_configs[exchange_name]["min_profitability"],
-                    "order_amount_usd": self.exchange_configs[exchange_name]["order_amount_usd"],
-                    "max_order_age": self.exchange_configs[exchange_name]["max_order_age"],
-                }
-                
-                # Validate trading pairs for this exchange
-                self.validate_trading_pairs(exchange_name)
-                
-                # Add to instance markets
-                self.instance_markets[exchange_name] = self.exchange_data[exchange_name]["trading_pairs"]
+        # Initialize essential attributes
+        self.exchange_1 = config.exchange_1
+        self.exchange_2 = config.exchange_2
+        self.trading_pairs = config.trading_pairs
+        self.min_profitability = Decimal(str(config.min_profitability))
+        self.order_amount_usd = Decimal(str(config.order_amount_usd))
+        self.max_order_age = config.max_order_age
+        self.check_interval = config.check_interval
         
-        # Create throttlers for each exchange
-        self.throttlers = {
-            "binance": AsyncThrottler(
-                rate_limits=[
-                    RateLimit(limit_id="GET", limit=10, time_interval=1.0),
-                    RateLimit(limit_id="POST", limit=15, time_interval=1.0),
-                ]
-            ),
-            "bybit": AsyncThrottler(
-                rate_limits=[
-                    RateLimit(limit_id="GET", limit=10, time_interval=1.0),
-                    RateLimit(limit_id="POST", limit=15, time_interval=1.0),
-                ]
-            )
-        }
-        
-        self.logger().info(f"Initialized SpotArbitrage strategy with {len(self.common_trading_pairs)} common trading pairs")
-        self.logger().info(f"Common trading pairs: {self.common_trading_pairs}")
-    
-    def validate_trading_pairs(self, exchange_name):
-        """Validate trading pairs for a specific exchange"""
-        if exchange_name not in self.connectors:
-            self.logger().error(f"Exchange {exchange_name} not found in connectors")
-            return
-            
-        connector = self.connectors[exchange_name]
-        valid_trading_pairs = []
-        
-        # Filter to only include common trading pairs
-        for trading_pair in self.common_trading_pairs:
-            try:
-                # Try to get the exchange symbol - this will fail if the pair doesn't exist
-                exchange_symbol = connector.exchange_symbol_associated_to_pair(trading_pair)
-                valid_trading_pairs.append(trading_pair)
-                self.logger().info(f"Validated trading pair on {exchange_name}: {trading_pair}")
-            except Exception as e:
-                self.logger().warning(f"Trading pair {trading_pair} not available on {exchange_name}: {str(e)}. Skipping.")
-        
-        # Update trading_pair list with only valid pairs
-        self.exchange_data[exchange_name]["trading_pairs"] = valid_trading_pairs
-    
-    def on_tick(self):
-        """
-        Main strategy logic, executed at regular intervals
-        1. Check if it's time to run the strategy
-        2. Get current prices from both exchanges
-        3. Identify arbitrage opportunities
-        4. Execute trades for profitable opportunities
-        """
-        # Check if it's time to run the strategy
-        if self.last_checked_ts < (self.current_timestamp - self.check_interval):
-            # Update prices and look for arbitrage opportunities
-            safe_ensure_future(self.update_prices_and_find_opportunities())
-            self.last_checked_ts = self.current_timestamp
-    
-    async def update_prices_and_find_opportunities(self):
-        """Update prices and find arbitrage opportunities"""
-        try:
-            # Get current prices for all trading pairs on both exchanges
-            await self.update_prices()
-            
-            # Find arbitrage opportunities
-            await self.find_arbitrage_opportunities()
-            
-            # Execute trades for profitable opportunities
-            await self.execute_arbitrage_trades()
-        except Exception as e:
-            self.logger().error(f"Error in update_prices_and_find_opportunities: {str(e)}")
-    
-    async def update_prices(self):
-        """Update prices for all trading pairs on both exchanges"""
-        for exchange_name in self.exchange_data:
-            if exchange_name not in self.connectors:
-                continue
-                
-            connector = self.connectors[exchange_name]
-            
-            for trading_pair in self.exchange_data[exchange_name]["trading_pairs"]:
-                try:
-                    # Use throttler to respect rate limits
-                    async with self.throttlers[exchange_name].execute_task(limit_id="GET"):
-                        # Get mid price
-                        price = connector.get_mid_price(trading_pair)
-                        
-                        # Store price
-                        if trading_pair not in self.prices:
-                            self.prices[trading_pair] = {}
-                        self.prices[trading_pair][exchange_name] = price
-                except Exception as e:
-                    self.logger().error(f"Error getting price for {trading_pair} on {exchange_name}: {str(e)}")
-    
-    async def find_arbitrage_opportunities(self):
-        """Find arbitrage opportunities between exchanges"""
+        # Initialize strategy variables
+        self.last_checked_ts = 0
+        self.prices = {}
+        self.active_orders = {}
         self.arbitrage_opportunities = {}
         
-        for trading_pair in self.common_trading_pairs:
-            # Check if we have prices for this pair on both exchanges
-            if trading_pair not in self.prices:
-                continue
-                
-            if "binance" not in self.prices[trading_pair] or "bybit" not in self.prices[trading_pair]:
-                continue
-            
-            binance_price = self.prices[trading_pair]["binance"]
-            bybit_price = self.prices[trading_pair]["bybit"]
-            
-            # Calculate price difference as a percentage
-            price_diff_pct = abs(binance_price - bybit_price) / min(binance_price, bybit_price)
-            
-            # Determine which exchange has higher price
-            if binance_price > bybit_price:
-                higher_exchange = "binance"
-                lower_exchange = "bybit"
+        # Initialize min_amount dictionary with defaults and user config
+        self.min_amount = self._initialize_min_amounts()
+        
+        # Check if connectors dictionary is provided
+        if not connectors:
+            self.logger().warning("No connectors dictionary provided. Strategy cannot start.")
+            self.ready_to_trade = False
+            return
+        
+        # Check that the specified exchanges are in the connectors
+        for exchange in [self.exchange_1, self.exchange_2]:
+            if exchange not in connectors:
+                self.logger().error(f"Exchange {exchange} not in the list of connectors.")
+                self.ready_to_trade = False
+                return
+        
+        # All checks passed, set ready to trade
+        self.ready_to_trade = True
+        self.logger().info("Strategy initialized successfully.")
+    
+    def _initialize_min_amounts(self) -> Dict[str, Decimal]:
+        """Initialize minimum order amounts from config and defaults"""
+        # Set some reasonable defaults for common pairs
+        defaults = {
+            "BTC-USDT": Decimal("0.0001"),
+            "ETH-USDT": Decimal("0.01"),
+            "SOL-USDT": Decimal("0.1"),
+            "BNB-USDT": Decimal("0.01"),
+            "ADA-USDT": Decimal("10"),
+            "XRP-USDT": Decimal("10"),
+            "DOGE-USDT": Decimal("10"),
+        }
+        
+        # Override with user configuration
+        min_amounts = {}
+        for pair in self.trading_pairs:
+            if pair in self.config.min_order_amounts:
+                min_amounts[pair] = Decimal(str(self.config.min_order_amounts[pair]))
+            elif pair in defaults:
+                min_amounts[pair] = defaults[pair]
             else:
-                higher_exchange = "bybit"
-                lower_exchange = "binance"
+                min_amounts[pair] = Decimal("0.01")  # Default fallback
+                
+        return min_amounts
+    
+    def tick(self, timestamp: float):
+        """
+        Main loop for the strategy, called at the specified interval
+        """
+        if not self.ready_to_trade:
+            return
+        
+        # Check if enough time has passed since the last check
+        if timestamp - self.last_checked_ts < self.check_interval:
+            return
+        
+        self.last_checked_ts = timestamp
+        
+        # Update prices
+        self._update_prices()
+        
+        # Find arbitrage opportunities
+        self._find_arbitrage_opportunities()
+        
+        # Execute arbitrage trades
+        self._execute_arbitrage_trades()
+        
+        # Clean up old orders
+        self._cleanup_old_orders(timestamp)
+    
+    def _update_prices(self):
+        """Update prices for all trading pairs on both exchanges"""
+        for exchange in [self.exchange_1, self.exchange_2]:
+            if exchange not in self.prices:
+                self.prices[exchange] = {}
             
-            # Check if the price difference exceeds the threshold
-            min_profitability = self.THRESHOLD / Decimal("100")  # Convert percentage to decimal
+            for trading_pair in self.trading_pairs:
+                try:
+                    # Get mid price from the order book
+                    connector = self.connectors[exchange]
+                    order_book = connector.get_order_book(trading_pair)
+                    best_ask = Decimal(str(order_book.ask_price()))
+                    best_bid = Decimal(str(order_book.bid_price()))
+                    
+                    # Using mid price for comparison
+                    mid_price = (best_ask + best_bid) / Decimal("2")
+                    self.prices[exchange][trading_pair] = mid_price
+                    
+                    # Store bid and ask separately for placing actual orders
+                    self.prices[f"{exchange}_bid"] = best_bid
+                    self.prices[f"{exchange}_ask"] = best_ask
+                except Exception as e:
+                    self.logger().error(f"Error updating prices for {exchange} {trading_pair}: {e}")
+    
+    def _find_arbitrage_opportunities(self):
+        """Find arbitrage opportunities between the two exchanges"""
+        self.arbitrage_opportunities = {}
+        
+        for trading_pair in self.trading_pairs:
+            # Ensure we have prices for both exchanges
+            if (trading_pair not in self.prices[self.exchange_1] or 
+                trading_pair not in self.prices[self.exchange_2]):
+                continue
             
-            if price_diff_pct >= min_profitability:
-                self.arbitrage_opportunities[trading_pair] = {
-                    "higher_exchange": higher_exchange,
-                    "lower_exchange": lower_exchange,
-                    "higher_price": max(binance_price, bybit_price),
-                    "lower_price": min(binance_price, bybit_price),
-                    "price_diff_pct": price_diff_pct,
-                    "profitable": True
+            price_1 = self.prices[self.exchange_1][trading_pair]
+            price_2 = self.prices[self.exchange_2][trading_pair]
+            
+            # Calculate the price difference as a percentage
+            if price_1 > price_2:
+                diff_pct = (price_1 / price_2 - Decimal("1")) * Decimal("100")
+                if diff_pct > self.min_profitability:
+                    self.arbitrage_opportunities[trading_pair] = {
+                        "buy_exchange": self.exchange_2,
+                        "sell_exchange": self.exchange_1,
+                        "buy_price": price_2,
+                        "sell_price": price_1,
+                        "difference_pct": diff_pct
+                    }
+                    self.logger().info(
+                        f"Arbitrage opportunity found: Buy {trading_pair} on {self.exchange_2} at {price_2}, "
+                        f"Sell on {self.exchange_1} at {price_1}, Difference: {diff_pct:.2f}%"
+                    )
+            elif price_2 > price_1:
+                diff_pct = (price_2 / price_1 - Decimal("1")) * Decimal("100")
+                if diff_pct > self.min_profitability:
+                    self.arbitrage_opportunities[trading_pair] = {
+                        "buy_exchange": self.exchange_1,
+                        "sell_exchange": self.exchange_2,
+                        "buy_price": price_1,
+                        "sell_price": price_2,
+                        "difference_pct": diff_pct
+                    }
+                    self.logger().info(
+                        f"Arbitrage opportunity found: Buy {trading_pair} on {self.exchange_1} at {price_1}, "
+                        f"Sell on {self.exchange_2} at {price_2}, Difference: {diff_pct:.2f}%"
+                    )
+    
+    def _execute_arbitrage_trades(self):
+        """Execute arbitrage trades for identified opportunities"""
+        for trading_pair, opportunity in self.arbitrage_opportunities.items():
+            # Check if we already have active orders for this pair
+            if trading_pair in self.active_orders:
+                continue
+            
+            buy_exchange = opportunity["buy_exchange"]
+            sell_exchange = opportunity["sell_exchange"]
+            
+            # Calculate order amount in base currency
+            base_asset, quote_asset = split_hb_trading_pair(trading_pair)
+            order_amount_quote = self.order_amount_usd
+            order_amount_base = order_amount_quote / opportunity["buy_price"]
+            
+            # Ensure minimum order size
+            if order_amount_base < self.min_amount[trading_pair]:
+                order_amount_base = self.min_amount[trading_pair]
+            
+            try:
+                # Place buy order
+                buy_order_id = self.buy(
+                    connector_name=buy_exchange,
+                    trading_pair=trading_pair,
+                    amount=order_amount_base,
+                    order_type=OrderType.LIMIT,
+                    price=opportunity["buy_price"] * Decimal("1.001"),  # Small buffer
+                )
+                
+                # Place sell order
+                sell_order_id = self.sell(
+                    connector_name=sell_exchange,
+                    trading_pair=trading_pair,
+                    amount=order_amount_base,
+                    order_type=OrderType.LIMIT,
+                    price=opportunity["sell_price"] * Decimal("0.999"),  # Small buffer
+                )
+                
+                # Record active orders
+                self.active_orders[trading_pair] = {
+                    "buy": {
+                        "order_id": buy_order_id,
+                        "exchange": buy_exchange,
+                        "timestamp": time.time()
+                    },
+                    "sell": {
+                        "order_id": sell_order_id,
+                        "exchange": sell_exchange,
+                        "timestamp": time.time()
+                    }
                 }
                 
                 self.logger().info(
-                    f"Arbitrage opportunity found for {trading_pair}: "
-                    f"Buy on {lower_exchange} at {min(binance_price, bybit_price)}, "
-                    f"Sell on {higher_exchange} at {max(binance_price, bybit_price)}, "
-                    f"Difference: {price_diff_pct:.2%}"
+                    f"Executed arbitrage: Buy {order_amount_base} {trading_pair} on {buy_exchange}, "
+                    f"Sell on {sell_exchange}"
                 )
-            else:
-                # Close any existing orders if price difference is minimal
-                if price_diff_pct < min_profitability * Decimal("0.5"):
-                    self.arbitrage_opportunities[trading_pair] = {
-                        "higher_exchange": higher_exchange,
-                        "lower_exchange": lower_exchange,
-                        "higher_price": max(binance_price, bybit_price),
-                        "lower_price": min(binance_price, bybit_price),
-                        "price_diff_pct": price_diff_pct,
-                        "profitable": False
-                    }
+            except Exception as e:
+                self.logger().error(f"Error executing arbitrage for {trading_pair}: {e}")
     
-    async def execute_arbitrage_trades(self):
-        """Execute trades for profitable arbitrage opportunities"""
-        for trading_pair, opportunity in self.arbitrage_opportunities.items():
-            if opportunity["profitable"]:
-                # Calculate order amount in base currency
-                higher_exchange = opportunity["higher_exchange"]
-                lower_exchange = opportunity["lower_exchange"]
-                
-                # Get order amount in USD
-                order_amount_usd = min(
-                    self.exchange_data[higher_exchange]["order_amount_usd"],
-                    self.exchange_data[lower_exchange]["order_amount_usd"]
-                )
-                
-                # Convert to base currency amount
-                base_amount = order_amount_usd / opportunity["higher_price"]
-                
-                # Ensure minimum order size
-                min_amount = self.min_amount.get(trading_pair, Decimal("0.001"))
-                base_amount = max(base_amount, min_amount)
-                
-                # Execute trades
-                try:
-                    # Sell on higher exchange
-                    async with self.throttlers[higher_exchange].execute_task(limit_id="POST"):
-                        self.sell(
-                            connector_name=higher_exchange,
-                            trading_pair=trading_pair,
-                            amount=base_amount,
-                            order_type=OrderType.MARKET,
-                            price=opportunity["higher_price"]
-                        )
-                        self.logger().info(f"Placed SELL order on {higher_exchange} for {trading_pair}: {base_amount} @ {opportunity['higher_price']}")
-                    
-                    # Buy on lower exchange
-                    async with self.throttlers[lower_exchange].execute_task(limit_id="POST"):
-                        self.buy(
-                            connector_name=lower_exchange,
-                            trading_pair=trading_pair,
-                            amount=base_amount,
-                            order_type=OrderType.MARKET,
-                            price=opportunity["lower_price"]
-                        )
-                        self.logger().info(f"Placed BUY order on {lower_exchange} for {trading_pair}: {base_amount} @ {opportunity['lower_price']}")
-                    
-                    # Track active orders
-                    if trading_pair not in self.active_orders:
-                        self.active_orders[trading_pair] = {}
-                    
-                    self.active_orders[trading_pair] = {
-                        "timestamp": self.current_timestamp,
-                        "higher_exchange": higher_exchange,
-                        "lower_exchange": lower_exchange,
-                        "amount": base_amount
-                    }
-                    
-                except Exception as e:
-                    self.logger().error(f"Error executing arbitrage trades for {trading_pair}: {str(e)}")
+    def _cleanup_old_orders(self, current_timestamp: float):
+        """Cancel orders that have been active for too long"""
+        orders_to_remove = []
+        
+        for trading_pair, orders in self.active_orders.items():
+            buy_order = orders["buy"]
+            sell_order = orders["sell"]
             
-            elif trading_pair in self.active_orders:
-                # Check if we need to close positions due to price convergence
-                order_age = self.current_timestamp - self.active_orders[trading_pair]["timestamp"]
-                max_order_age = max(
-                    self.exchange_data["binance"]["max_order_age"],
-                    self.exchange_data["bybit"]["max_order_age"]
-                )
-                
-                if order_age > max_order_age:
-                    self.logger().info(f"Closing arbitrage position for {trading_pair} due to price convergence or timeout")
-                    # Remove from active orders
-                    del self.active_orders[trading_pair]
-    
-    def format_status(self) -> str:
-        """Format status display"""
-        if not self.ready:
-            return "Market connectors are not ready."
+            # Check if buy order is old enough to cancel
+            if current_timestamp - buy_order["timestamp"] > self.max_order_age:
+                try:
+                    self.cancel(buy_order["exchange"], trading_pair, buy_order["order_id"])
+                    self.logger().info(f"Canceled old buy order for {trading_pair}")
+                except Exception as e:
+                    self.logger().error(f"Error canceling buy order: {e}")
+            
+            # Check if sell order is old enough to cancel
+            if current_timestamp - sell_order["timestamp"] > self.max_order_age:
+                try:
+                    self.cancel(sell_order["exchange"], trading_pair, sell_order["order_id"])
+                    self.logger().info(f"Canceled old sell order for {trading_pair}")
+                except Exception as e:
+                    self.logger().error(f"Error canceling sell order: {e}")
+            
+            # If both orders are old, remove them from active orders
+            if (current_timestamp - buy_order["timestamp"] > self.max_order_age and
+                current_timestamp - sell_order["timestamp"] > self.max_order_age):
+                orders_to_remove.append(trading_pair)
         
-        # Format timestamps in UTC
-        current_time = datetime.utcfromtimestamp(self.current_timestamp).strftime('%Y-%m-%d %H:%M:%S UTC')
-        last_checked_time = datetime.utcfromtimestamp(self.last_checked_ts).strftime('%Y-%m-%d %H:%M:%S UTC')
-        
-        lines = []
-        lines.append("Spot Arbitrage Strategy")
-        lines.append("---------------------")
-        lines.append(f"Current timestamp: {current_time}")
-        lines.append(f"Last checked timestamp: {last_checked_time}")
-        lines.append(f"Check interval: {self.check_interval} seconds")
-        lines.append(f"Ready: {self.ready}")
-        lines.append(f"Active orders: {len(self.active_orders)}")
-        lines.append(f"Arbitrage opportunities: {len(self.arbitrage_opportunities)}")
-        lines.append("--------------------------------")
-        lines.append(f"threshold is set to {self.THRESHOLD} %")
-        lines.append("--------------------------------")
-        
-        # Show current prices
-        lines.append("\nCurrent Prices:")
-        for trading_pair in self.common_trading_pairs:
-            if trading_pair in self.prices:
-                binance_price = self.prices[trading_pair].get("binance", Decimal("0"))
-                bybit_price = self.prices[trading_pair].get("bybit", Decimal("0"))
-                
-                if binance_price > 0 and bybit_price > 0:
-                    price_diff_pct = abs(binance_price - bybit_price) / min(binance_price, bybit_price)
-                    lines.append(f"{trading_pair}: Binance={binance_price:.8f}, Bybit={bybit_price:.8f}, Diff={price_diff_pct:.2%}")
-        
-        # Show active arbitrage opportunities
-        lines.append("\nArbitrage Opportunities:")
-        for trading_pair, opportunity in self.arbitrage_opportunities.items():
-            if opportunity["profitable"]:
-                lines.append(
-                    f"{trading_pair}: Buy on {opportunity['lower_exchange']} at {opportunity['lower_price']:.8f}, "
-                    f"Sell on {opportunity['higher_exchange']} at {opportunity['higher_price']:.8f}, "
-                    f"Diff: {opportunity['price_diff_pct']:.2%}"
-                )
-        
-        # Show active orders
-        lines.append("\nActive Orders:")
-        for trading_pair, order_info in self.active_orders.items():
-            order_age = self.current_timestamp - order_info["timestamp"]
-            lines.append(
-                f"{trading_pair}: Buy on {order_info['lower_exchange']}, Sell on {order_info['higher_exchange']}, "
-                f"Amount: {order_info['amount']}, Age: {order_age}s"
-            )
-        
-        return "\n".join(lines)
+        # Remove completed/canceled orders
+        for trading_pair in orders_to_remove:
+            del self.active_orders[trading_pair]
     
     def did_fill_order(self, event: OrderFilledEvent):
-        """Called when an order is filled"""
+        """Handle order filled events"""
         self.logger().info(f"Order filled: {event}")
+        # You could add more sophisticated handling here
     
     def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
-        """Called when a buy order is completed"""
+        """Handle buy order completed events"""
         self.logger().info(f"Buy order completed: {event}")
+        # You could add more sophisticated handling here
     
     def did_complete_sell_order(self, event: SellOrderCompletedEvent):
-        """Called when a sell order is completed"""
+        """Handle sell order completed events"""
         self.logger().info(f"Sell order completed: {event}")
-
-    @property
-    def ready(self):
-        """Check if all connectors are ready"""
-        return all(connector.ready for connector in self.connectors.values()) 
+        # You could add more sophisticated handling here 
