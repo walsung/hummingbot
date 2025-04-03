@@ -30,6 +30,23 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 class SpotArbitrageConfig(StrategyV2ConfigBase):
     """Configuration for the Spot Arbitrage strategy"""
     
+    # Add these two fields to match the YAML template
+    strategy: Optional[str] = Field(
+        default="spot_arbitrage",
+        client_data=ClientFieldData(
+            prompt=None,
+            prompt_on_new=False,
+        )
+    )
+    
+    template_version: Optional[int] = Field(
+        default=1,
+        client_data=ClientFieldData(
+            prompt=None,
+            prompt_on_new=False,
+        )
+    )
+    
     # Override the inherited fields with empty defaults
     candles_config: List[CandlesConfig] = Field(
         default_factory=list,
@@ -254,16 +271,18 @@ class SpotArbitrage(StrategyV2Base):
                     # Get mid price from the order book
                     connector = self.connectors[exchange]
                     order_book = connector.get_order_book(trading_pair)
-                    best_ask = Decimal(str(order_book.ask_price()))
-                    best_bid = Decimal(str(order_book.bid_price()))
+                    
+                    # Get the top of the order book instead of using non-existent methods
+                    best_ask = Decimal(str(order_book.get_price(False)))  # Convert float to Decimal
+                    best_bid = Decimal(str(order_book.get_price(True)))   # Convert float to Decimal
                     
                     # Using mid price for comparison
                     mid_price = (best_ask + best_bid) / Decimal("2")
                     self.prices[exchange][trading_pair] = mid_price
                     
                     # Store bid and ask separately for placing actual orders
-                    self.prices[f"{exchange}_bid"] = best_bid
-                    self.prices[f"{exchange}_ask"] = best_ask
+                    self.prices[f"{exchange}_bid_{trading_pair}"] = best_bid  # Add trading_pair to key
+                    self.prices[f"{exchange}_ask_{trading_pair}"] = best_ask  # Add trading_pair to key
                 except Exception as e:
                     self.logger().error(f"Error updating prices for {exchange} {trading_pair}: {e}")
     
