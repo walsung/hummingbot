@@ -3,6 +3,19 @@ Spot Arbitrage Strategy V2
 
 This strategy monitors price differences between the same trading pair on two exchanges
 and executes arbitrage trades when profitable opportunities arise.
+
+# Spot Arbitrage Strategy Configuration
+
+## New Balance Handling Options
+
+- `arbitrage_mode`: Controls how the strategy handles arbitrage when balances are insufficient
+  - `both`: Execute both buy and sell sides of arbitrage (default)
+  - `buy_only`: Only execute the buy side of arbitrage opportunities
+  - `sell_only`: Only execute the sell side of arbitrage opportunities
+
+- `auto_adjust_order_size`: When set to true, automatically adjusts order sizes to meet exchange minimums
+  - `true`: Auto-adjust order sizes to minimum requirements (default)
+  - `false`: Skip opportunities where calculated order size is below minimum
 """
 
 import logging
@@ -136,6 +149,10 @@ class SpotArbitrageConfig(StrategyV2ConfigBase):
             prompt_on_new=False,
         )
     )
+    
+    # New options for better balance handling
+    arbitrage_mode: str = "both"  # Options: "both", "buy_only", "sell_only"
+    auto_adjust_order_size: bool = True  # Auto-adjust to minimum order size if needed
     
     @validator("trading_pairs", pre=True, allow_reuse=True)
     def validate_trading_pairs(cls, v):
@@ -354,16 +371,31 @@ class SpotArbitrage(StrategyV2Base):
         order_amount_quote = self.order_amount_usd
         order_amount_base = order_amount_quote / opportunity["buy_price"]
         
-        # Ensure minimum order size
-        if order_amount_base < self.min_amount[trading_pair]:
-            order_amount_base = self.min_amount[trading_pair]
+        # Get exchange minimum order sizes
+        buy_connector = self.connectors[buy_exchange]
+        sell_connector = self.connectors[sell_exchange]
+        
+        # Check minimum order size requirements
+        min_order_size = self.min_amount.get(trading_pair, Decimal("0"))
+        
+        # Check if our calculated order size is below minimum
+        if order_amount_base < min_order_size:
+            self.logger().warning(
+                f"Calculated order size {order_amount_base} is below minimum {min_order_size} for {trading_pair}"
+            )
+            # Adjust to minimum order size if possible
+            if self.config.auto_adjust_order_size:
+                order_amount_base = min_order_size
+                self.logger().info(f"Auto-adjusted order size to minimum: {order_amount_base}")
+            else:
+                return False
         
         # Check buy exchange has enough quote currency (e.g., USDT)
-        buy_quote_balance = self.connectors[buy_exchange].get_available_balance(quote_asset)
+        buy_quote_balance = buy_connector.get_available_balance(quote_asset)
         required_quote_amount = order_amount_base * opportunity["buy_price"]
         
         # Check sell exchange has enough base currency (e.g., BTC)
-        sell_base_balance = self.connectors[sell_exchange].get_available_balance(base_asset)
+        sell_base_balance = sell_connector.get_available_balance(base_asset)
         
         # Log balances for debugging
         self.logger().info(
@@ -372,8 +404,15 @@ class SpotArbitrage(StrategyV2Base):
             f"{sell_exchange} {base_asset} balance: {sell_base_balance}, required: {order_amount_base}."
         )
         
-        # Return True if both exchanges have sufficient balance
-        return buy_quote_balance >= required_quote_amount and sell_base_balance >= order_amount_base
+        # Check if we can execute one-sided arbitrage if configured
+        if self.config.arbitrage_mode == "both":
+            return buy_quote_balance >= required_quote_amount and sell_base_balance >= order_amount_base
+        elif self.config.arbitrage_mode == "buy_only":
+            return buy_quote_balance >= required_quote_amount
+        elif self.config.arbitrage_mode == "sell_only":
+            return sell_base_balance >= order_amount_base
+        else:
+            return buy_quote_balance >= required_quote_amount and sell_base_balance >= order_amount_base
     
     def _execute_arbitrage_trades(self):
         """Execute arbitrage trades for identified opportunities"""
