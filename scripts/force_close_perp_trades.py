@@ -1,381 +1,372 @@
 #!/usr/bin/env python3
-import asyncio
-import logging
-import os
 import time
-import yaml
 from decimal import Decimal
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set, Optional, Union, Any
 
-from hummingbot.client.config.config_helpers import ClientConfigAdapter
-from hummingbot.client.config.config_data_types import ClientFieldData
+from pydantic import Field, validator
+# Import the correct V2 base classes
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.connector.derivative.position import Position
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, TradeType
-from hummingbot.logger import HummingbotLogger
-from hummingbot.strategy_v2.models.base import RunnableStatus
-from hummingbot.strategy_v2.runnable_base import RunnableBase
+from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 
 
-class ForceClosePerpTrades(RunnableBase):
-    """
-    A strategy that force closes all open perpetual positions for a specified exchange.
+# V2-compliant configuration class
+class ForceCloseConfig(StrategyV2ConfigBase):
+    """Configuration for the ForceClosePerpTrades strategy"""
+    # Strategy info
+    strategy_name: str = "force_close_perp_trades"
     
-    Usage:
-    1. Configure the target exchange in the YAML config file
-    2. Run the strategy to close all positions
-    3. The strategy will stop automatically once all positions are closed
+    # Exchange settings
+    exchange: str = Field(
+        ..., # Required field
+        description="The exchange connector name to close positions on"
+    )
+    
+    # Operating parameters
+    max_retry_attempts: int = Field(
+        default=3,
+        description="Maximum number of retries for failed orders"
+    )
+    slippage_tolerance: Decimal = Field(
+        default=Decimal("0.005"),
+        description="Maximum allowed slippage (0.005 = 0.5%)"
+    )
+    max_position_close_time: int = Field(
+        default=60,
+        description="Seconds to wait before retrying a close attempt"
+    )
+    # Add the fields that were causing validation errors
+    log_level: str = Field(
+        default="INFO",
+        description="Log level for this specific script (Options: DEBUG, INFO, WARNING, ERROR)"
+    )
+    update_interval: float = Field(
+        default=1.0,
+        description="How frequently the strategy checks positions (in seconds)"
+    )
+    
+    # Empty candles_config list - required for StrategyV2Base
+    candles_config: List[CandlesConfig] = Field(
+        default_factory=list,
+        description="Candle configuration (not used in this strategy)"
+    )
+    
+    # Define markets property correctly
+    @property
+    def markets(self) -> Dict[str, Set[str]]:
+        """Return the markets dictionary for this strategy"""
+        return {self.exchange: set()}
+
+
+class ForceClosePerpTrades(StrategyV2Base):
+    """
+    A V2 strategy to force close all perpetual positions on a specified exchange.
+    
+    This strategy:
+    1. Connects to the specified exchange
+    2. Finds all open perpetual positions
+    3. Places market orders to close all positions
+    4. Monitors for successful closure and retries if needed
+    5. Stops once all positions are closed or maximum retries reached
     """
     
-    _logger = None
+    # CRITICAL: StrategyV2 REQUIRES this class variable
+    markets = {}  # Set properly in init_markets
     
     @classmethod
-    def logger(cls) -> HummingbotLogger:
-        if cls._logger is None:
-            cls._logger = logging.getLogger(__name__)
-        return cls._logger
+    def init_markets(cls, config: ForceCloseConfig):
+        """Initialize markets from the config (V2 pattern)"""
+        # Ensure it's a dictionary with proper structure for .items() method
+        cls.markets = {config.exchange: set()}
+        return cls.markets
     
-    # Required fields for the YAML config
-    @classmethod
-    def config_fields(cls) -> Dict[str, ClientFieldData]:
-        return {
-            "exchange": ClientFieldData(
-                key="exchange",
-                prompt="Enter the name of the perpetual exchange to close positions on",
-                required=True,
-                is_connect_key=True,
-                prompt_on_new=True,
-            ),
-            "config_file_path": ClientFieldData(
-                key="config_file_path",
-                prompt="(Optional) Enter the path to the configuration file",
-                required=False,
-                is_connect_key=False,
-                prompt_on_new=False,
-            ),
-        }
-    
-    def __init__(
-        self,
-        client_config_map: ClientConfigAdapter,
-        exchange: str,
-        config_file_path: Optional[str] = None,
-        update_interval: float = 1.0,
-    ):
-        """Initialize the ForceClosePerpTrades strategy
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: ForceCloseConfig):
+        """Initialize the strategy according to V2 pattern"""
+        # Pass all arguments to parent constructor
+        super().__init__(connectors, config)
         
-        :param client_config_map: Global client configuration
-        :param exchange: Name of the exchange to close positions on
-        :param config_file_path: Path to the config file (optional)
-        :param update_interval: How frequently to update the strategy
-        """
-        self._client_config_map = client_config_map
-        self._exchange = exchange
-        self._config_file_path = config_file_path
+        # Store configuration
+        self._config = config
+        self._exchange = config.exchange
         
-        # Default configuration values
-        self._update_interval = update_interval
-        self._max_retry_attempts = 3
-        self._slippage_tolerance = Decimal("0.005")  # 0.5%
-        self._max_position_close_time = 60  # seconds
-        self._log_level = "INFO"
-        
-        # Load additional configuration from YAML if provided
-        self._config = {}
-        if config_file_path and os.path.exists(config_file_path):
-            with open(config_file_path, "r") as file:
-                self._config = yaml.safe_load(file)
-                self._parse_config()
-                self.logger().info(f"Loaded configuration from {config_file_path}")
-        
-        # Apply configuration
-        self._set_log_level()
-        
-        # Initialize parent class with updated interval
-        super().__init__(self._update_interval)
-        
-        # Keep track of positions we already attempted to close to avoid duplicate orders
+        # Tracking variables
         self._closing_positions: Set[str] = set()
         self._closed_positions: Set[str] = set()
         self._retry_counts: Dict[str, int] = {}
         self._position_close_start_times: Dict[str, float] = {}
-        self._connector = None
-        
-        # Flag to ensure we clean up and stop after all positions are closed
         self._all_positions_closed = False
-    
-    def _parse_config(self):
-        """Parse values from the loaded config file"""
-        if not self._config:
+        self._initial_check_done = False
+        self._stop_initiated = False
+        
+    def on_tick(self):
+        """Main control loop (V2 uses on_tick, not tick)"""
+        if not self.ready_to_trade:
             return
-            
-        # Extract configuration values with defaults
-        if "update_interval" in self._config:
-            self._update_interval = float(self._config["update_interval"])
-            
-        if "max_retry_attempts" in self._config:
-            self._max_retry_attempts = int(self._config["max_retry_attempts"])
-            
-        if "slippage_tolerance" in self._config:
-            self._slippage_tolerance = Decimal(str(self._config["slippage_tolerance"]))
-            
-        if "max_position_close_time" in self._config:
-            self._max_position_close_time = int(self._config["max_position_close_time"])
-            
-        if "log_level" in self._config:
-            self._log_level = self._config["log_level"]
-            
-        # Override exchange if specified in config
-        if "exchange" in self._config and not self._exchange:
-            self._exchange = self._config["exchange"]
+        
+        if self._all_positions_closed:
+            if not self._stop_initiated:
+                self.logger().info("All positions are closed. Stopping strategy.")
+                self.close_execution_by("all_positions_closed")  # V2 pattern
+                self._stop_initiated = True
+            return
+        
+        connector = self.connectors.get(self._exchange)
+        if not connector:
+            self.logger().error(f"Exchange connector '{self._exchange}' not found.")
+            self.close_execution_by("connector_not_found")
+            return
+        
+        # Check connector supports perpetual trading
+        if not hasattr(connector, "account_positions"):
+            self.logger().error(f"Exchange {self._exchange} does not support perpetual trading.")
+            self.close_execution_by("not_perpetual_exchange")
+            return
+        
+        # Initial position check
+        if not self._initial_check_done:
+            self._perform_initial_check(connector)
+            if self._all_positions_closed:
+                self.close_execution_by("no_positions_found")
+                return
+            self._initial_check_done = True
+        
+        # Process any open positions
+        self._process_positions(connector)
     
-    def _set_log_level(self):
-        """Set the logger level based on configuration"""
-        log_level = logging.INFO
+    def _perform_initial_check(self, connector):
+        """Initial check and logging of positions"""
+        self.logger().info(f"==== Force Close Perpetual Trades (V2) on {self._exchange} ====")
+        self.logger().info(
+            f"Settings: Max retries: {self._config.max_retry_attempts}, "
+            f"Slippage tolerance: {self._config.slippage_tolerance * 100:.2f}%, "
+            f"Close timeout: {self._config.max_position_close_time}s"
+        )
         
-        if self._log_level == "DEBUG":
-            log_level = logging.DEBUG
-        elif self._log_level == "INFO":
-            log_level = logging.INFO
-        elif self._log_level == "WARNING":
-            log_level = logging.WARNING
-        elif self._log_level == "ERROR":
-            log_level = logging.ERROR
-            
-        self.logger().setLevel(log_level)
-        
-    async def on_start(self):
-        """Called when the strategy starts"""
-        from hummingbot.client.hummingbot_application import HummingbotApplication
-        
-        # Get the exchange connector
         try:
-            self._connector = HummingbotApplication.main_application().markets[self._exchange]
-            
-            # Check if the connector is perpetual
-            if not hasattr(self._connector, "account_positions"):
-                self.logger().error(f"Exchange {self._exchange} is not a perpetual exchange.")
-                self.stop()
-                return
-                
-            self.logger().info(f"Starting force close of all positions on {self._exchange}")
-            self.logger().info(f"Configuration: Update interval: {self._update_interval}s, "
-                              f"Max retries: {self._max_retry_attempts}, "
-                              f"Slippage tolerance: {self._slippage_tolerance*100}%, "
-                              f"Max close time: {self._max_position_close_time}s")
-            
-            # Log current positions
-            positions = self._connector.account_positions
+            positions = connector.account_positions
             if not positions:
-                self.logger().info(f"No open positions found on {self._exchange}")
+                self.logger().info("No open positions found.")
                 self._all_positions_closed = True
-                self.stop()
                 return
-                
+            
+            self.logger().info(f"Found {len(positions)} positions to close:")
             for pos_key, position in positions.items():
+                self._retry_counts[pos_key] = 0  # Initialize retry count
                 self.logger().info(
-                    f"Found position: {position.trading_pair}, "
-                    f"Side: {position.position_side}, "
-                    f"Amount: {position.amount}, "
-                    f"Entry Price: {position.entry_price}, "
-                    f"Leverage: {position.leverage}x"
+                    f"  - {position.trading_pair} | {position.position_side} | "
+                    f"Amount: {position.amount} | Entry: {position.entry_price}"
                 )
-                
-        except KeyError:
-            self.logger().error(f"Exchange {self._exchange} not found or not initialized.")
-            self.stop()
-            
-    async def control_task(self):
-        """Main control loop that runs on every update interval"""
-        if self._connector is None or self._all_positions_closed:
-            self.stop()
+        except Exception as e:
+            self.logger().error(f"Error fetching positions: {e}", exc_info=True)
+            self.close_execution_by("error_fetching_positions")
             return
-            
-        # Get current positions
-        current_positions = self._connector.account_positions
         
-        # Check if all positions are closed
+        self._initial_check_done = True
+    
+    def _process_positions(self, connector):
+        """Process all positions and attempt to close them"""
+        current_positions = connector.account_positions
         if not current_positions:
-            if self._closing_positions:
-                self.logger().info("All positions have been closed successfully!")
-                self._all_positions_closed = True
-                self.stop()
-            else:
-                self.logger().info(f"No open positions found on {self._exchange}")
-                self._all_positions_closed = True
-                self.stop()
+            self.logger().info("All positions have been closed.")
+            self._all_positions_closed = True
             return
             
-        # Track positions that timed out
         timed_out_positions = set()
         current_time = time.time()
         
-        # Close each position
-        for pos_key, position in current_positions.items():
-            # Check if position has timed out
-            if pos_key in self._position_close_start_times:
-                elapsed_time = current_time - self._position_close_start_times[pos_key]
-                if elapsed_time > self._max_position_close_time:
-                    self.logger().warning(
-                        f"Position {pos_key} close timed out after {elapsed_time:.1f}s. "
-                        f"Will retry."
-                    )
-                    timed_out_positions.add(pos_key)
+        # Check for timeouts
+        for pos_key in list(self._position_close_start_times.keys()):
+            if pos_key not in current_positions:
+                continue  # Position already closed
             
-            # Check if we need to close this position
-            if (pos_key not in self._closing_positions and 
-                pos_key not in self._closed_positions) or pos_key in timed_out_positions:
-                
+            elapsed_time = current_time - self._position_close_start_times[pos_key]
+            if elapsed_time > self._config.max_position_close_time:
+                self.logger().warning(
+                    f"Position {pos_key} close timed out after {elapsed_time:.1f}s."
+                )
+                if pos_key in self._closing_positions:
+                    self._closing_positions.remove(pos_key)
+                timed_out_positions.add(pos_key)
+        
+        # Process each open position
+        for pos_key, position in list(current_positions.items()):
+            needs_close = (pos_key not in self._closing_positions and 
+                         pos_key not in self._closed_positions)
+            needs_retry = pos_key in timed_out_positions
+            
+            if needs_close or needs_retry:
                 # Check retry count
-                if pos_key in self._retry_counts and self._retry_counts[pos_key] >= self._max_retry_attempts:
+                current_retry_count = self._retry_counts.get(pos_key, 0)
+                next_retry_count = current_retry_count + 1
+                
+                if next_retry_count > self._config.max_retry_attempts:
                     self.logger().error(
-                        f"Failed to close position {pos_key} after {self._max_retry_attempts} attempts. "
-                        f"Manual intervention required."
+                        f"Position {pos_key} failed to close after {self._config.max_retry_attempts} attempts."
                     )
+                    self._closed_positions.add(pos_key)
+                    if pos_key in self._closing_positions:
+                        self._closing_positions.remove(pos_key)
                     continue
                 
                 # Attempt to close the position
-                await self._close_position(position)
+                retry_text = f"(Retry #{next_retry_count})" if needs_retry or current_retry_count > 0 else ""
+                self.logger().info(f"Closing position {pos_key} {retry_text}")
+                self._close_position(position)
                 
-                # Update tracking data
-                if pos_key not in self._retry_counts:
-                    self._retry_counts[pos_key] = 0
-                
-                if pos_key in timed_out_positions:
-                    self._retry_counts[pos_key] += 1
-                    self.logger().info(f"Retry #{self._retry_counts[pos_key]} for position {pos_key}")
-                
+                # Update tracking
+                self._retry_counts[pos_key] = next_retry_count
                 self._position_close_start_times[pos_key] = current_time
                 self._closing_positions.add(pos_key)
-                
-        # Update closed positions by comparing with current positions
-        closed_positions = self._closing_positions - set(current_positions.keys())
-        if closed_positions:
-            for pos_key in closed_positions:
-                self.logger().info(f"Position {pos_key} closed successfully")
-                self._closed_positions.add(pos_key)
-            self._closing_positions -= closed_positions
-            
-    async def _close_position(self, position: Position):
-        """Close a single position
+                if pos_key in self._closed_positions:
+                    self._closed_positions.remove(pos_key)
         
-        :param position: Position object to close
-        """
+        # Update confirmed closed positions
+        confirmed_closed = self._closing_positions - set(current_positions.keys())
+        if confirmed_closed:
+            for pos_key in confirmed_closed:
+                if pos_key not in self._closed_positions:
+                    self.logger().info(f"Position {pos_key} closed successfully.")
+                    self._closed_positions.add(pos_key)
+            self._closing_positions -= confirmed_closed
+    
+    def _close_position(self, position):
+        """Submit a market order to close the position"""
+        connector = self.connectors.get(self._exchange)
+        if not connector:
+            return
+        
+        pos_key = connector.position_key(position.trading_pair, position.position_side)
+        
         try:
-            # Determine the trade type to close the position
+            # Determine order parameters
             side = TradeType.BUY if position.position_side == PositionSide.SHORT else TradeType.SELL
+            amount = abs(position.amount)
             
-            # Log closure attempt
-            self.logger().info(
-                f"Closing position: {position.trading_pair}, "
-                f"Side: {position.position_side}, "
-                f"Amount: {abs(position.amount)}, "
-                f"Action: {'BUY' if side == TradeType.BUY else 'SELL'}"
-            )
+            # Safety checks
+            if amount <= Decimal("0"):
+                self.logger().warning(f"Skipping {pos_key}: Invalid amount {amount}")
+                self._closed_positions.add(pos_key)
+                if pos_key in self._closing_positions:
+                    self._closing_positions.remove(pos_key)
+                return
             
-            # Get current market price
-            current_price = self._connector.get_price_by_type(
-                position.trading_pair, 
-                side
-            )
+            # Get trading rules
+            trading_rule = connector.trading_rules.get(position.trading_pair)
+            if trading_rule and amount < trading_rule.min_order_size:
+                self.logger().warning(
+                    f"Skipping {pos_key}: Amount {amount} below min size {trading_rule.min_order_size}"
+                )
+                self._closed_positions.add(pos_key)
+                if pos_key in self._closing_positions:
+                    self._closing_positions.remove(pos_key)
+                return
             
-            # Apply slippage tolerance to price for limit orders
-            # For BUY orders (closing SHORT), increase price
-            # For SELL orders (closing LONG), decrease price
-            adjusted_price = current_price
+            # Get price for slippage calculation
+            price = None
+            try:
+                price = connector.get_price_by_type(position.trading_pair, side)
+            except Exception:
+                try:
+                    price = connector.get_mid_price(position.trading_pair)
+                    self.logger().warning(
+                        f"Using mid price for {position.trading_pair} (order book price unavailable)"
+                    )
+                except Exception as e:
+                    self.logger().error(f"Cannot get price for {position.trading_pair}: {e}")
+                    if pos_key in self._closing_positions:
+                        self._closing_positions.remove(pos_key)
+                    return
+            
+            # Apply slippage tolerance
+            if side == TradeType.BUY:  # Closing short, willing to pay more
+                adjusted_price = price * (Decimal("1") + self._config.slippage_tolerance)
+            else:  # Closing long, willing to accept less
+                adjusted_price = price * (Decimal("1") - self._config.slippage_tolerance)
+            
+            # Quantize price if trading rules available
+            if trading_rule:
+                adjusted_price = connector.quantize_order_price(position.trading_pair, adjusted_price)
+                
+            # V2 uses create_executor actions
+            # But for simple script, we can use direct connector methods
             if side == TradeType.BUY:
-                adjusted_price = current_price * (Decimal("1") + self._slippage_tolerance)
+                order_id = connector.buy(
+                    trading_pair=position.trading_pair,
+                    amount=amount,
+                    order_type=OrderType.MARKET,
+                    price=adjusted_price,
+                    position_action=PositionAction.CLOSE
+                )
             else:
-                adjusted_price = current_price * (Decimal("1") - self._slippage_tolerance)
-            
-            # Create a market order to close the position
-            client_order_id = await self._connector._create_order(
-                trade_type=side,
-                order_id=f"close_{position.trading_pair}_{position.position_side}_{self._connector.current_timestamp}",
-                trading_pair=position.trading_pair,
-                amount=abs(position.amount),
-                order_type=OrderType.MARKET,
-                price=adjusted_price,  # For MARKET orders, this is used as a maximum slippage price
-                position_action=PositionAction.CLOSE,
-            )
+                order_id = connector.sell(
+                    trading_pair=position.trading_pair,
+                    amount=amount,
+                    order_type=OrderType.MARKET,
+                    price=adjusted_price,
+                    position_action=PositionAction.CLOSE
+                )
             
             self.logger().info(
-                f"Order {client_order_id} submitted to close position {position.trading_pair} "
-                f"({position.position_side})"
+                f"Submitted order to close {amount} {position.trading_pair} "
+                f"({position.position_side}) at {adjusted_price}"
             )
-            
+        
         except Exception as e:
-            self.logger().error(
-                f"Error closing position {position.trading_pair} ({position.position_side}): {e}",
-                exc_info=True
-            )
-            # Don't increment retry count here, since we'll retry on the next control_task loop
-
-    def on_stop(self):
-        """Called when the strategy stops"""
+            self.logger().error(f"Error closing position {pos_key}: {e}", exc_info=True)
+            if pos_key in self._closing_positions:
+                self._closing_positions.remove(pos_key)
+            if pos_key in self._position_close_start_times:
+                del self._position_close_start_times[pos_key]
+    
+    def close_execution_by(self, reason: str):
+        """V2 pattern for closing strategy execution"""
+        self.logger().info(f"Stopping strategy due to: {reason}")
+        self._log_final_status()
+        # V2Base doesn't have stop() method, but will stop through executor orchestration
+    
+    def _log_final_status(self):
+        """Log final strategy status"""
+        self.logger().info(f"==== Force Close Strategy Summary for {self._exchange} ====")
+        
+        # Get final positions
+        connector = self.connectors.get(self._exchange)
+        remaining_positions = {}
+        
+        if connector and hasattr(connector, "account_positions"):
+            try:
+                remaining_positions = connector.account_positions
+            except Exception as e:
+                self.logger().error(f"Error fetching final positions: {e}")
+        
+        # Log results
         if self._all_positions_closed:
-            self.logger().info(f"Strategy completed. All positions on {self._exchange} have been closed.")
+            self.logger().info("All targeted positions have been closed successfully.")
         else:
             # Log positions that couldn't be closed
-            remaining_positions = self._connector.account_positions if self._connector else {}
-            if remaining_positions:
-                self.logger().warning(f"Strategy stopped with {len(remaining_positions)} positions still open:")
-                for pos_key, position in remaining_positions.items():
-                    self.logger().warning(
-                        f"Remaining position: {position.trading_pair}, "
-                        f"Side: {position.position_side}, "
-                        f"Amount: {position.amount}"
+            failed_positions = []
+            for key, pos in remaining_positions.items():
+                if key in self._retry_counts:
+                    failed_positions.append(
+                        f"{pos.trading_pair} {pos.position_side} {pos.amount} "
+                        f"(Attempts: {self._retry_counts.get(key, 'unknown')})"
                     )
-            else:
-                self.logger().warning(f"Strategy stopped before confirming all positions were closed!")
+            
+            if failed_positions:
+                self.logger().error(
+                    f"MANUAL INTERVENTION NEEDED: {len(failed_positions)} positions could not be closed:"
+                )
+                for pos_info in failed_positions:
+                    self.logger().error(f"  - {pos_info}")
+        
+        self.logger().info("==== Force Close Strategy Completed ====")
 
-
-def main():
-    """Simple main function for testing the strategy independently"""
-    import asyncio
-    import argparse
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-    from hummingbot.client.config.global_config_map import global_config_map
+# Required to register the strategy with Hummingbot
+def start(config: ForceCloseConfig):
+    """Entry point called by Hummingbot"""
+    # Initialize our class-level markets variable
+    ForceClosePerpTrades.init_markets(config)
     
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Force close all perpetual positions on an exchange")
-    parser.add_argument("-e", "--exchange", type=str, help="Exchange name (e.g., binance_perpetual)")
-    parser.add_argument("-c", "--config", type=str, help="Path to configuration file")
-    parser.add_argument("-t", "--timeout", type=int, default=300, 
-                        help="Maximum run time in seconds before forcing exit")
-    args = parser.parse_args()
-    
-    # Create sample config
-    client_config_map = ClientConfigAdapter(global_config_map)
-    
-    # Set exchange and config from command line or defaults
-    exchange = args.exchange or "binance_perpetual"
-    config_path = args.config or "config.yml"
-    timeout = args.timeout
-    
-    # Create and run strategy
-    strategy = ForceClosePerpTrades(
-        client_config_map=client_config_map,
-        exchange=exchange,
-        config_file_path=config_path,
-    )
-    
-    # Run the strategy
-    async def run_strategy():
-        strategy.start()
-        # Run for specified timeout
-        await asyncio.sleep(timeout)
-        if strategy.status != RunnableStatus.TERMINATED:
-            print(f"Strategy timed out after {timeout} seconds. Stopping.")
-            strategy.stop()
-    
-    # Run the event loop
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(run_strategy())
-    except KeyboardInterrupt:
-        print("Keyboard interrupt detected. Stopping strategy...")
-        strategy.stop()
-    
-
-if __name__ == "__main__":
-    main() 
+    # Return the class itself - Hummingbot will instantiate it later
+    return ForceClosePerpTrades 
