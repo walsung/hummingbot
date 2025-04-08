@@ -112,3 +112,124 @@ To have your exchange connector or other pull request merged into the codebase, 
 
 * **License**: Hummingbot is open source and licensed under [Apache 2.0](./LICENSE).
 * **Data collection**: See [Reporting](https://hummingbot.org/reporting/) for information on anonymous data collection and reporting in Hummingbot.
+
+# Force Close Perpetual Trades
+
+A Hummingbot strategy to force close all perpetual positions on a specified exchange.
+
+## Overview
+
+This script provides a simple strategy that:
+
+1. Connects to a specified perpetual exchange
+2. Identifies all open positions
+3. Immediately closes all positions with market orders
+4. Stops once all positions are closed
+
+This can be helpful in emergency situations where you need to quickly exit all positions, or as part of a risk management workflow.
+
+## Requirements
+
+- Hummingbot installed and configured (version 1.0.0 or later)
+- A perpetual exchange connector configured in Hummingbot
+- Python 3.8+
+- PyYAML (`pip install pyyaml`)
+
+## Installation
+
+1. Copy the `force_close_perp_trades.py` script to your Hummingbot scripts directory:
+   ```
+   cp force_close_perp_trades.py /path/to/hummingbot/scripts/
+   ```
+
+2. Copy the sample `config.yml` to your desired location (or create your own):
+   ```
+   cp config.yml /path/to/your/config/directory/
+   ```
+
+## Usage
+
+### From Hummingbot Client
+
+1. Start Hummingbot:
+   ```
+   cd /path/to/hummingbot
+   ./start
+   ```
+
+2. Import the script as a strategy:
+   ```
+   import scripts.force_close_perp_trades
+   ```
+
+3. Create and start the strategy:
+   ```
+   create force_close_perp_trades
+   ```
+
+4. When prompted, provide:
+   - The exchange name (e.g., "binance_perpetual")
+   - Path to your config file (optional)
+
+5. The strategy will run and automatically close all positions.
+
+### From Command Line
+
+You can run the script directly with command-line arguments:
+
+```
+cd /path/to/hummingbot
+python scripts/force_close_perp_trades.py -e binance_perpetual -c /path/to/config.yml
+```
+
+#### Command-Line Arguments
+
+| Argument | Short | Description |
+|----------|-------|-------------|
+| `--exchange` | `-e` | Exchange name (e.g., "binance_perpetual") |
+| `--config` | `-c` | Path to configuration file |
+| `--timeout` | `-t` | Maximum runtime in seconds before exiting (default: 300) |
+
+Example with all options:
+```
+python scripts/force_close_perp_trades.py -e bybit_perpetual -c ./my_config.yml -t 120
+```
+
+## Configuration
+
+Edit the `config.yml` file to customize behavior:
+
+```yaml
+# Exchange-specific settings
+exchange: "binance_perpetual"  # The exchange to close positions on
+
+# Strategy settings
+update_interval: 1.0  # How frequently to check and update position status (in seconds)
+max_retry_attempts: 3  # Maximum number of retries for failed close orders
+
+# Logging settings
+log_level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+
+# Advanced settings (optional)
+slippage_tolerance: 0.005  # 0.5% maximum allowed slippage for market orders
+max_position_close_time: 60  # Maximum time in seconds to wait for a position to close before retrying
+```
+
+## Supported Exchanges
+
+This strategy works with any perpetual exchange connector in Hummingbot, including:
+
+- Binance Perpetual
+- Bybit Perpetual
+- dYdX Perpetual
+- OKX Perpetual
+- Gate.io Perpetual
+- And others...
+
+## Disclaimer
+
+This script uses market orders to close positions immediately, which may result in slippage and higher fees compared to limit orders. Use with caution and awareness of the market impact.
+
+## License
+
+Same as Hummingbot - Apache 2.0
